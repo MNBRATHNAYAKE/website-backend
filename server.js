@@ -4,6 +4,7 @@ const axios = require('axios');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const https = require('https');
 require('dotenv').config();
 
 const app = express();
@@ -70,48 +71,62 @@ async function sendAlert(monitor, status) {
 }
 
 // 5. Monitoring Logic (The Worker)
+// 5. Monitoring Logic (The Worker)
 async function checkMonitors() {
   const monitors = await Monitor.find();
   
+  // Create an HTTPS agent that ignores SSL errors (Fixes "Down" on gov/legacy sites)
+  const httpsAgent = new https.Agent({  
+    rejectUnauthorized: false 
+  });
+
   for (const monitor of monitors) {
-    const start = Date.now();
+    // const start = Date.now(); // Optional: Track response time later if needed
     let currentStatus = 'down';
 
     try {
-      // Timeout set to 10s
-      await axios.get(monitor.url, { timeout: 10000 });
+      // We assume it's UP until proven otherwise
+      await axios.get(monitor.url, { 
+        timeout: 15000, // Increased timeout to 15s (some gov sites are slow)
+        httpsAgent: httpsAgent, // Use the lenient SSL agent
+        headers: {
+          // Fake a real browser so we don't get blocked
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'max-age=0'
+        }
+      });
       currentStatus = 'up';
     } catch (error) {
+      console.log(`❌ ${monitor.name} check failed: ${error.message}`);
       currentStatus = 'down';
     }
 
     // Logic: Status Changed?
     if (monitor.status !== currentStatus) {
-      
-      // If going DOWN, wait for confirmation (simple logic here: immediate change for now)
-      // In production, you might want a "double check" logic here.
-      
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
       
-      // Limit history to last 500 entries to save space
+      // Limit history to last 500 entries
       if (monitor.history.length > 500) monitor.history.shift();
 
       if (currentStatus === 'down') {
         monitor.downSince = new Date();
-        monitor.alertSent = false; // Reset so we can send alert
+        monitor.alertSent = false;
       } else {
         monitor.downSince = null;
         monitor.alertSent = false;
-        // Recovered! Send alert immediately
-        await sendAlert(monitor, 'up');
+        await sendAlert(monitor, 'up'); // Recovered!
       }
     }
 
-    // Handle "Still Down" Alert logic (e.g., if down for 5 mins)
+    // Handle "Still Down" Alert logic
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-      if (minutesDown >= 2) { // Alert after 2 minutes of downtime
+      if (minutesDown >= 2) { 
         await sendAlert(monitor, 'down');
         monitor.alertSent = true;
       }
