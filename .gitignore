@@ -1,0 +1,16 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Data files
+monitors.json
+subscribers.json
+
+# Logs
+*.log
+
+# OS and IDE files
+.DS_Store
+.vscode/
