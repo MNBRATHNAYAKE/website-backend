@@ -8,16 +8,17 @@ const https = require('https');
 require('dotenv').config();
 
 const app = express();
+// CRASH FIX: Use the port Railway provides, or 5000 locally
 const PORT = process.env.PORT || 5000;
 
 // 1. Middleware
 app.use(express.json());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "*", // Allow your frontend
+  origin: process.env.FRONTEND_URL || "*", 
   credentials: true
 }));
 
-// 2. Database Connection (MongoDB)
+// 2. Database Connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
@@ -45,10 +46,10 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
 // 4. Email Transporter
 const transporter = nodemailer.createTransport({
-  service: 'gmail', // Or use host/port from your env
+  service: 'gmail', 
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS, // App Password, not login password
+    pass: process.env.SMTP_PASS, 
   },
 });
 
@@ -62,7 +63,6 @@ async function sendAlert(monitor, status) {
 
   console.log(`📧 Sending ${subscribers.length} alerts for ${monitor.name}`);
 
-  // Send in parallel for speed
   const promises = subscribers.map(sub => 
     transporter.sendMail({ from: process.env.SMTP_USER, to: sub.email, subject, text })
       .catch(e => console.error(`Failed to send to ${sub.email}`))
@@ -70,32 +70,21 @@ async function sendAlert(monitor, status) {
   await Promise.all(promises);
 }
 
-// 5. Monitoring Logic (The Worker)
-// 5. Monitoring Logic (The Worker)
+// 5. Monitoring Logic (Standard HTTP Check)
 async function checkMonitors() {
   const monitors = await Monitor.find();
   
-  // Create an HTTPS agent that ignores SSL errors (Fixes "Down" on gov/legacy sites)
-  const httpsAgent = new https.Agent({  
-    rejectUnauthorized: false 
-  });
+  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
-    // const start = Date.now(); // Optional: Track response time later if needed
     let currentStatus = 'down';
 
     try {
-      // We assume it's UP until proven otherwise
       await axios.get(monitor.url, { 
-        timeout: 15000, // Increased timeout to 15s (some gov sites are slow)
-        httpsAgent: httpsAgent, // Use the lenient SSL agent
+        timeout: 15000, 
+        httpsAgent: httpsAgent, 
         headers: {
-          // Fake a real browser so we don't get blocked
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
           'Cache-Control': 'max-age=0'
         }
       });
@@ -110,25 +99,33 @@ async function checkMonitors() {
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
       
-      // Limit history to last 500 entries
       if (monitor.history.length > 500) monitor.history.shift();
 
       if (currentStatus === 'down') {
+        // --- STEP 1: Just mark the time. Do NOT send email yet. ---
         monitor.downSince = new Date();
         monitor.alertSent = false;
       } else {
+        // --- STEP 3: It came back UP ---
+        // Only send "Recovered" email if we actually sent a "Down" email previously.
+        // This prevents spamming "Recovered" for a glitch that nobody knew about.
+        if (monitor.alertSent) {
+             await sendAlert(monitor, 'up'); 
+        }
         monitor.downSince = null;
         monitor.alertSent = false;
-        await sendAlert(monitor, 'up'); // Recovered!
       }
     }
 
-    // Handle "Still Down" Alert logic
+    // --- STEP 2: The 5-Minute Check ---
+    // If it is DOWN, has a start time, and we haven't emailed yet...
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-      if (minutesDown >= 2) { 
+      
+      // CHANGED: 2 -> 5 minutes
+      if (minutesDown >= 5) { 
         await sendAlert(monitor, 'down');
-        monitor.alertSent = true;
+        monitor.alertSent = true; // Mark as sent so we don't send again
       }
     }
 
@@ -165,9 +162,7 @@ app.delete('/monitors/:id', async (req, res) => {
 app.post('/subscribers', async (req, res) => {
   try {
     const { email } = req.body;
-    // Simple regex for email validation
     if (!email || !email.includes('@')) return res.status(400).json({error: 'Invalid email'});
-    
     await Subscriber.updateOne({ email }, { email }, { upsert: true });
     res.json({ message: 'Subscribed' });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -178,4 +173,6 @@ app.get('/subscribers', async (req, res) => {
   res.json({ count });
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
