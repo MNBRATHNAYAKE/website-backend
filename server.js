@@ -13,7 +13,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION CHECK: INSTANT-SAVE + PORT 587 FIX");
+console.log("🚀 VERSION CHECK: SSL FIX + INSTANT ALERT");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -37,7 +37,7 @@ const MonitorSchema = new mongoose.Schema({
   url: String,
   status: { type: String, default: 'unknown' },
   lastChecked: Date,
-  downSince: Date,
+  downSince: Date, // Kept for schema compatibility, but not strictly used in new logic
   alertSent: { type: Boolean, default: false },
   history: [{
     status: String,
@@ -52,19 +52,23 @@ const SubscriberSchema = new mongoose.Schema({
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
-// 2. Email Transporter (Switched to Port 587)
+// 2. Email Transporter (THE FIX: Switched to 'service: gmail')
+// This automatically uses Port 465 (SSL), which bypasses the Port 587 blocks on Railway.
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,               // Standard STARTTLS port
-  secure: false,           // Must be false for 587
+  service: 'gmail', 
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS, 
-  },
-  tls: {
-    rejectUnauthorized: false // Helps avoid SSL errors on cloud servers
-  },
-  connectionTimeout: 10000, 
+    pass: process.env.SMTP_PASS, // Ensure this is your APP PASSWORD
+  }
+});
+
+// Verify connection on startup
+transporter.verify((error, success) => {
+  if (error) {
+    console.error("❌ Email Connection Error:", error);
+  } else {
+    console.log("✅ Email Service is Ready (SSL/Port 465)");
+  }
 });
 
 // Helper: Send Alerts
@@ -72,20 +76,28 @@ async function sendAlert(monitor, status) {
   const subscribers = await Subscriber.find();
   if (subscribers.length === 0) return;
 
-  const subject = `Monitor ${status.toUpperCase()}: ${monitor.name}`;
+  const subject = `🚨 ALERT: ${monitor.name} is ${status.toUpperCase()}`;
   const text = `The service "${monitor.name}" (${monitor.url}) is now ${status.toUpperCase()}.`;
 
   console.log(`📧 Sending ${subscribers.length} alerts for ${monitor.name}`);
 
-  const promises = subscribers.map(sub => 
-    transporter.sendMail({ from: process.env.SMTP_USER, to: sub.email, subject, text })
-      .then(() => console.log(`✅ Email sent to ${sub.email}`))
-      .catch(e => console.error(`❌ FAILED to send to ${sub.email}. Reason: ${e.message}`))
-  );
-  await Promise.all(promises);
+  // Send to all subscribers
+  const mailOptions = {
+    from: `"Uptime Monitor" <${process.env.SMTP_USER}>`,
+    to: subscribers.map(s => s.email),
+    subject: subject,
+    text: text
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log("✅ Emails sent successfully.");
+  } catch (error) {
+    console.error("❌ Failed to send email:", error.message);
+  }
 }
 
-// 3. Monitoring Logic
+// 3. Monitoring Logic (Simplified)
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
@@ -95,7 +107,7 @@ async function checkMonitors() {
 
     try {
       await axios.get(monitor.url, { 
-        timeout: 15000, 
+        timeout: 10000, 
         httpsAgent: httpsAgent, 
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
@@ -107,57 +119,32 @@ async function checkMonitors() {
       currentStatus = 'down';
     }
 
-    // --- LOGIC START ---
-
-    // 1. Detect Status Change
+    // Update History
     if (monitor.status !== currentStatus) {
       console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
       if (monitor.history.length > 500) monitor.history.shift();
-
-      if (currentStatus === 'down') {
-        monitor.downSince = new Date();
-        monitor.alertSent = false;
-      } else {
-        if (monitor.alertSent) {
-             await sendAlert(monitor, 'up'); 
-        }
-        monitor.downSince = null;
-        monitor.alertSent = false;
-      }
     }
 
-    // 2. Zombie Fix
-    if (currentStatus === 'down' && !monitor.downSince) {
+    // --- NEW SIMPLIFIED LOGIC ---
+    // If it's UP, just reset the flag
+    if (currentStatus === 'up') {
+      monitor.alertSent = false;
+      monitor.downSince = null;
+    } 
+    // If it's DOWN and we haven't emailed yet -> Email immediately
+    else if (currentStatus === 'down') {
+      if (!monitor.alertSent) {
+        console.log(`🔻 ${monitor.name} is DOWN. Sending Immediate Alert.`);
+        
+        // 1. Set flag TRUE immediately to prevent loops
+        monitor.alertSent = true;
         monitor.downSince = new Date();
-        monitor.alertSent = false; 
-    }
+        await monitor.save();
 
-    // 3. The 5-Minute Timer
-    if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
-      const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-      
-      if (minutesDown > 1) {
-          console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
-      }
-
-      if (minutesDown >= 5) { 
-        console.log(`🚀 5 Minutes Reached! Sending Alert for ${monitor.name}`);
-        
-        // --- 4. INSTANT SAVE FIX ---
-        // We set TRUE and Save immediately. 
-        // This ensures the DB is updated BEFORE we attempt the risky email.
-        monitor.alertSent = true; 
-        await monitor.save(); 
-        
-        try {
-            await sendAlert(monitor, 'down');
-        } catch (err) {
-            console.error("❌ Critical Email Error:", err.message);
-        }
-        // Continue to next loop without saving again to be safe
-        continue; 
+        // 2. Send Email
+        await sendAlert(monitor, 'down');
       }
     }
 
@@ -209,11 +196,12 @@ app.get('/api/test-email', async (req, res) => {
         console.log("🧪 Starting Email Test...");
         if (!process.env.SMTP_PASS) throw new Error("SMTP_PASS is MISSING!");
         
+        // Simple test using the new 'service: gmail' transporter
         let info = await transporter.sendMail({
             from: process.env.SMTP_USER,
             to: process.env.SMTP_USER, 
             subject: "Test Email from Railway",
-            text: "Port 587 Fix Applied! 🎉"
+            text: "Port 465/SSL Fix Applied! 🎉"
         });
 
         console.log("✅ Email Test Success:", info.response);
@@ -221,10 +209,9 @@ app.get('/api/test-email', async (req, res) => {
     } catch (error) {
         console.error("❌ Email Test Failed:", error);
         res.status(500).json({ error: error.message });
-    }	
+    } 
 });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
-
