@@ -4,40 +4,30 @@ const axios = require('axios');
 const nodemailer = require('nodemailer');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const https = require('https');
-const dns = require('node:dns');
-
-// 1. Force IPv4 to prevent timeouts
-dns.setDefaultResultOrder('ipv4first');
-
 require('dotenv').config();
-
-console.log("------------------------------------------------");
-console.log("🚀 VERSION CHECK: SSL FIX + INSTANT ALERT");
-console.log("------------------------------------------------");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
+// 1. Middleware
 app.use(express.json());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "*", 
+  origin: process.env.FRONTEND_URL || "*", // Allow your frontend
   credentials: true
 }));
 
-// Database
+// 2. Database Connection (MongoDB)
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
-// Schemas
+// 3. Define Schemas
 const MonitorSchema = new mongoose.Schema({
   name: String,
   url: String,
-  status: { type: String, default: 'unknown' },
+  status: { type: String, default: 'unknown' }, // 'up', 'down', 'unknown'
   lastChecked: Date,
-  downSince: Date, // Kept for schema compatibility, but not strictly used in new logic
+  downSince: Date,
   alertSent: { type: Boolean, default: false },
   history: [{
     status: String,
@@ -52,23 +42,13 @@ const SubscriberSchema = new mongoose.Schema({
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
-// 2. Email Transporter (THE FIX: Switched to 'service: gmail')
-// This automatically uses Port 465 (SSL), which bypasses the Port 587 blocks on Railway.
+// 4. Email Transporter
 const transporter = nodemailer.createTransport({
-  service: 'gmail', 
+  service: 'gmail', // Or use host/port from your env
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS, // Ensure this is your APP PASSWORD
-  }
-});
-
-// Verify connection on startup
-transporter.verify((error, success) => {
-  if (error) {
-    console.error("❌ Email Connection Error:", error);
-  } else {
-    console.log("✅ Email Service is Ready (SSL/Port 465)");
-  }
+    pass: process.env.SMTP_PASS, // App Password, not login password
+  },
 });
 
 // Helper: Send Alerts
@@ -76,75 +56,64 @@ async function sendAlert(monitor, status) {
   const subscribers = await Subscriber.find();
   if (subscribers.length === 0) return;
 
-  const subject = `🚨 ALERT: ${monitor.name} is ${status.toUpperCase()}`;
+  const subject = `Monitor ${status.toUpperCase()}: ${monitor.name}`;
   const text = `The service "${monitor.name}" (${monitor.url}) is now ${status.toUpperCase()}.`;
 
   console.log(`📧 Sending ${subscribers.length} alerts for ${monitor.name}`);
 
-  // Send to all subscribers
-  const mailOptions = {
-    from: `"Uptime Monitor" <${process.env.SMTP_USER}>`,
-    to: subscribers.map(s => s.email),
-    subject: subject,
-    text: text
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    console.log("✅ Emails sent successfully.");
-  } catch (error) {
-    console.error("❌ Failed to send email:", error.message);
-  }
+  // Send in parallel for speed
+  const promises = subscribers.map(sub => 
+    transporter.sendMail({ from: process.env.SMTP_USER, to: sub.email, subject, text })
+      .catch(e => console.error(`Failed to send to ${sub.email}`))
+  );
+  await Promise.all(promises);
 }
 
-// 3. Monitoring Logic (Simplified)
+// 5. Monitoring Logic (The Worker)
 async function checkMonitors() {
   const monitors = await Monitor.find();
-  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
+  
   for (const monitor of monitors) {
+    const start = Date.now();
     let currentStatus = 'down';
 
     try {
-      await axios.get(monitor.url, { 
-        timeout: 10000, 
-        httpsAgent: httpsAgent, 
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-          'Cache-Control': 'max-age=0'
-        }
-      });
+      // Timeout set to 10s
+      await axios.get(monitor.url, { timeout: 10000 });
       currentStatus = 'up';
     } catch (error) {
       currentStatus = 'down';
     }
 
-    // Update History
+    // Logic: Status Changed?
     if (monitor.status !== currentStatus) {
-      console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
+      
+      // If going DOWN, wait for confirmation (simple logic here: immediate change for now)
+      // In production, you might want a "double check" logic here.
+      
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
+      
+      // Limit history to last 500 entries to save space
       if (monitor.history.length > 500) monitor.history.shift();
+
+      if (currentStatus === 'down') {
+        monitor.downSince = new Date();
+        monitor.alertSent = false; // Reset so we can send alert
+      } else {
+        monitor.downSince = null;
+        monitor.alertSent = false;
+        // Recovered! Send alert immediately
+        await sendAlert(monitor, 'up');
+      }
     }
 
-    // --- NEW SIMPLIFIED LOGIC ---
-    // If it's UP, just reset the flag
-    if (currentStatus === 'up') {
-      monitor.alertSent = false;
-      monitor.downSince = null;
-    } 
-    // If it's DOWN and we haven't emailed yet -> Email immediately
-    else if (currentStatus === 'down') {
-      if (!monitor.alertSent) {
-        console.log(`🔻 ${monitor.name} is DOWN. Sending Immediate Alert.`);
-        
-        // 1. Set flag TRUE immediately to prevent loops
-        monitor.alertSent = true;
-        monitor.downSince = new Date();
-        await monitor.save();
-
-        // 2. Send Email
+    // Handle "Still Down" Alert logic (e.g., if down for 5 mins)
+    if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
+      const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
+      if (minutesDown >= 2) { // Alert after 2 minutes of downtime
         await sendAlert(monitor, 'down');
+        monitor.alertSent = true;
       }
     }
 
@@ -153,9 +122,10 @@ async function checkMonitors() {
   }
 }
 
+// Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-// API Routes
+// 6. API Routes
 app.get('/monitors', async (req, res) => {
   try {
     const monitors = await Monitor.find();
@@ -180,7 +150,9 @@ app.delete('/monitors/:id', async (req, res) => {
 app.post('/subscribers', async (req, res) => {
   try {
     const { email } = req.body;
+    // Simple regex for email validation
     if (!email || !email.includes('@')) return res.status(400).json({error: 'Invalid email'});
+    
     await Subscriber.updateOne({ email }, { email }, { upsert: true });
     res.json({ message: 'Subscribed' });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -191,27 +163,4 @@ app.get('/subscribers', async (req, res) => {
   res.json({ count });
 });
 
-app.get('/api/test-email', async (req, res) => {
-    try {
-        console.log("🧪 Starting Email Test...");
-        if (!process.env.SMTP_PASS) throw new Error("SMTP_PASS is MISSING!");
-        
-        // Simple test using the new 'service: gmail' transporter
-        let info = await transporter.sendMail({
-            from: process.env.SMTP_USER,
-            to: process.env.SMTP_USER, 
-            subject: "Test Email from Railway",
-            text: "Port 465/SSL Fix Applied! 🎉"
-        });
-
-        console.log("✅ Email Test Success:", info.response);
-        res.json({ success: true, message: "Email Sent!", details: info.response });
-    } catch (error) {
-        console.error("❌ Email Test Failed:", error);
-        res.status(500).json({ error: error.message });
-    } 
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
