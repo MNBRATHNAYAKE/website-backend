@@ -94,7 +94,9 @@ async function checkMonitors() {
       currentStatus = 'down';
     }
 
-    // Logic: Status Changed?
+    // --- LOGIC START ---
+
+    // 1. Detect Status Change
     if (monitor.status !== currentStatus) {
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
@@ -102,13 +104,11 @@ async function checkMonitors() {
       if (monitor.history.length > 500) monitor.history.shift();
 
       if (currentStatus === 'down') {
-        // --- STEP 1: Just mark the time. Do NOT send email yet. ---
+        // Site just went DOWN: Start the timer
         monitor.downSince = new Date();
         monitor.alertSent = false;
       } else {
-        // --- STEP 3: It came back UP ---
-        // Only send "Recovered" email if we actually sent a "Down" email previously.
-        // This prevents spamming "Recovered" for a glitch that nobody knew about.
+        // Site came UP: Send email ONLY if we previously sent a "DOWN" alert
         if (monitor.alertSent) {
              await sendAlert(monitor, 'up'); 
         }
@@ -117,12 +117,17 @@ async function checkMonitors() {
       }
     }
 
-    // --- STEP 2: The 5-Minute Check ---
-    // If it is DOWN, has a start time, and we haven't emailed yet...
+    // 2. CRITICAL FIX: Handle "Zombie" Downtime
+    // If site is ALREADY down in DB but missing a timestamp (e.g. from before this code update),
+    // set the timestamp now so the 5-minute timer can actually start.
+    if (currentStatus === 'down' && !monitor.downSince) {
+        monitor.downSince = new Date();
+    }
+
+    // 3. The 5-Minute Timer Check
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
       
-      // CHANGED: 2 -> 5 minutes
       if (minutesDown >= 5) { 
         await sendAlert(monitor, 'down');
         monitor.alertSent = true; // Mark as sent so we don't send again
