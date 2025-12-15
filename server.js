@@ -9,7 +9,7 @@ require('dotenv').config();
 
 // --- VERSION CHECK LOG ---
 console.log("------------------------------------------------");
-console.log("🚀 VERSION CHECK: ZOMBIE FIX V2 IS LIVE!");
+console.log("🚀 VERSION CHECK: FINAL SSL + SPAM FIX LIVE!");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -49,13 +49,16 @@ const SubscriberSchema = new mongoose.Schema({
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
-// 4. Email Transporter
+// 4. Email Transporter (UPDATED: SSL Fix)
 const transporter = nodemailer.createTransport({
-  service: 'gmail', 
+  host: 'smtp.gmail.com',  // Force Gmail Host
+  port: 465,               // Force SSL Port (Fixes Timeout)
+  secure: true,            // TRUE for port 465
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS, 
   },
+  connectionTimeout: 10000, // Prevent hanging
 });
 
 // Helper: Send Alerts
@@ -70,7 +73,8 @@ async function sendAlert(monitor, status) {
 
   const promises = subscribers.map(sub => 
     transporter.sendMail({ from: process.env.SMTP_USER, to: sub.email, subject, text })
-      .catch(e => console.error(`Failed to send to ${sub.email}`))
+      .then(() => console.log(`✅ Email sent to ${sub.email}`))
+      .catch(e => console.error(`❌ FAILED to send to ${sub.email}. Reason: ${e.message}`))
   );
   await Promise.all(promises);
 }
@@ -78,7 +82,6 @@ async function sendAlert(monitor, status) {
 // 5. Monitoring Logic
 async function checkMonitors() {
   const monitors = await Monitor.find();
-  
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
@@ -95,7 +98,6 @@ async function checkMonitors() {
       });
       currentStatus = 'up';
     } catch (error) {
-      // console.log(`❌ ${monitor.name} check failed: ${error.message}`);
       currentStatus = 'down';
     }
 
@@ -124,27 +126,33 @@ async function checkMonitors() {
     }
 
     // 2. CRITICAL ZOMBIE FIX
-    // If site is down, but 'downSince' is missing, OR 'alertSent' is stuck as true...
-    // We reset it so the timer can run fresh.
     if (currentStatus === 'down' && !monitor.downSince) {
         console.log(`⚠️ Fixing Zombie Timer for ${monitor.name}. Restarting timer.`);
         monitor.downSince = new Date();
-        monitor.alertSent = false; // FORCE RESET so email can send
+        monitor.alertSent = false; 
     }
 
     // 3. The 5-Minute Timer Check
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
       
-      // Log progress so you know it's working
+      // Log progress
       if (minutesDown > 1) {
           console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
       }
 
       if (minutesDown >= 5) { 
         console.log(`🚀 5 Minutes Reached! Sending Alert for ${monitor.name}`);
-        await sendAlert(monitor, 'down');
-        monitor.alertSent = true; // Mark as sent so we don't send again
+        
+        // --- SPAM FIX: Mark as sent BEFORE trying to email ---
+        // This stops the infinite loop if email fails
+        monitor.alertSent = true; 
+        
+        try {
+            await sendAlert(monitor, 'down');
+        } catch (err) {
+            console.error("❌ Critical Email Error:", err.message);
+        }
       }
     }
 
@@ -193,23 +201,21 @@ app.get('/subscribers', async (req, res) => {
 });
 
 
-// --- EMAIL DEBUG ROUTE (Add this to the bottom of server.js) ---
+// --- EMAIL DEBUG ROUTE ---
 app.get('/api/test-email', async (req, res) => {
     try {
         console.log("🧪 Starting Email Test...");
-        console.log(`👤 Using User: ${process.env.SMTP_USER}`); // Checks if variable is loaded
+        console.log(`👤 Using User: ${process.env.SMTP_USER}`); 
         
-        // Check if password exists (don't log the actual password)
         if (!process.env.SMTP_PASS) {
             throw new Error("SMTP_PASS is MISSING or Empty!");
         } else {
             console.log(`🔑 Password is set (${process.env.SMTP_PASS.length} chars)`);
         }
 
-        // Try sending
         let info = await transporter.sendMail({
             from: process.env.SMTP_USER,
-            to: process.env.SMTP_USER, // Send to yourself
+            to: process.env.SMTP_USER, 
             subject: "Test Email from Railway",
             text: "If you see this, your email configuration is PERFECT! 🎉"
         });
@@ -226,6 +232,7 @@ app.get('/api/test-email', async (req, res) => {
         });
     }
 });
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
