@@ -22,9 +22,7 @@ app.use(cors({
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
-  console.log("------------------------------------------------");
-console.log("🚀 VERSION CHECK: THE NEW CODE IS LOADED!");
-console.log("------------------------------------------------");
+  
 
 // 3. Define Schemas
 const MonitorSchema = new mongoose.Schema({
