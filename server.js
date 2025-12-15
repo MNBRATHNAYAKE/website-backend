@@ -192,6 +192,40 @@ app.get('/subscribers', async (req, res) => {
   res.json({ count });
 });
 
+
+// --- EMAIL DEBUG ROUTE (Add this to the bottom of server.js) ---
+app.get('/api/test-email', async (req, res) => {
+    try {
+        console.log("🧪 Starting Email Test...");
+        console.log(`👤 Using User: ${process.env.SMTP_USER}`); // Checks if variable is loaded
+        
+        // Check if password exists (don't log the actual password)
+        if (!process.env.SMTP_PASS) {
+            throw new Error("SMTP_PASS is MISSING or Empty!");
+        } else {
+            console.log(`🔑 Password is set (${process.env.SMTP_PASS.length} chars)`);
+        }
+
+        // Try sending
+        let info = await transporter.sendMail({
+            from: process.env.SMTP_USER,
+            to: process.env.SMTP_USER, // Send to yourself
+            subject: "Test Email from Railway",
+            text: "If you see this, your email configuration is PERFECT! 🎉"
+        });
+
+        console.log("✅ Email Test Success:", info.response);
+        res.json({ success: true, message: "Email Sent!", details: info.response });
+    } catch (error) {
+        console.error("❌ Email Test Failed:", error);
+        res.status(500).json({ 
+            error: "Email Failed", 
+            reason: error.message, 
+            code: error.code, 
+            command: error.command 
+        });
+    }
+});
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
