@@ -7,6 +7,11 @@ const mongoose = require('mongoose');
 const https = require('https');
 require('dotenv').config();
 
+// --- VERSION CHECK LOG ---
+console.log("------------------------------------------------");
+console.log("🚀 VERSION CHECK: ZOMBIE FIX V2 IS LIVE!");
+console.log("------------------------------------------------");
+
 const app = express();
 // CRASH FIX: Use the port Railway provides, or 5000 locally
 const PORT = process.env.PORT || 5000;
@@ -22,7 +27,6 @@ app.use(cors({
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
-  
 
 // 3. Define Schemas
 const MonitorSchema = new mongoose.Schema({
@@ -71,7 +75,7 @@ async function sendAlert(monitor, status) {
   await Promise.all(promises);
 }
 
-// 5. Monitoring Logic (Standard HTTP Check)
+// 5. Monitoring Logic
 async function checkMonitors() {
   const monitors = await Monitor.find();
   
@@ -91,7 +95,7 @@ async function checkMonitors() {
       });
       currentStatus = 'up';
     } catch (error) {
-      console.log(`❌ ${monitor.name} check failed: ${error.message}`);
+      // console.log(`❌ ${monitor.name} check failed: ${error.message}`);
       currentStatus = 'down';
     }
 
@@ -99,6 +103,7 @@ async function checkMonitors() {
 
     // 1. Detect Status Change
     if (monitor.status !== currentStatus) {
+      console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
       monitor.status = currentStatus;
       monitor.history.push({ status: currentStatus, timestamp: new Date() });
       
@@ -118,18 +123,26 @@ async function checkMonitors() {
       }
     }
 
-    // 2. CRITICAL FIX: Handle "Zombie" Downtime
-    // If site is ALREADY down in DB but missing a timestamp (e.g. from before this code update),
-    // set the timestamp now so the 5-minute timer can actually start.
+    // 2. CRITICAL ZOMBIE FIX
+    // If site is down, but 'downSince' is missing, OR 'alertSent' is stuck as true...
+    // We reset it so the timer can run fresh.
     if (currentStatus === 'down' && !monitor.downSince) {
+        console.log(`⚠️ Fixing Zombie Timer for ${monitor.name}. Restarting timer.`);
         monitor.downSince = new Date();
+        monitor.alertSent = false; // FORCE RESET so email can send
     }
 
     // 3. The 5-Minute Timer Check
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
       
+      // Log progress so you know it's working
+      if (minutesDown > 1) {
+          console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
+      }
+
       if (minutesDown >= 5) { 
+        console.log(`🚀 5 Minutes Reached! Sending Alert for ${monitor.name}`);
         await sendAlert(monitor, 'down');
         monitor.alertSent = true; // Mark as sent so we don't send again
       }
