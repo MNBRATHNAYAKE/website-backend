@@ -6,6 +6,8 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const https = require('https');
 require('dotenv').config();
+const dns = require('node:dns');
+dns.setDefaultResultOrder('ipv4first'); // <--- THIS IS THE MAGIC FIX
 
 // --- VERSION CHECK LOG ---
 console.log("------------------------------------------------");
@@ -50,15 +52,18 @@ const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
 // 4. Email Transporter (UPDATED: SSL Fix)
+// 4. Email Transporter (Updated: IPv4 + Long Timeout)
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',  // Force Gmail Host
-  port: 465,               // Force SSL Port (Fixes Timeout)
-  secure: true,            // TRUE for port 465
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true, 
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS, 
   },
-  connectionTimeout: 10000, // Prevent hanging
+  connectionTimeout: 30000, // Increased to 30 seconds
+  greetingTimeout: 30000,   // Wait longer for Gmail to say "Hello"
+  socketTimeout: 30000,     // Wait longer for data
 });
 
 // Helper: Send Alerts
