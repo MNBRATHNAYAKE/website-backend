@@ -1,20 +1,19 @@
 // server.js
 const express = require('express');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const https = require('https');
 const dns = require('node:dns');
+const { Resend } = require('resend'); // ✅ NEW: Using Resend
 
-// --- 1. CRITICAL NETWORK FIXES ---
-// Forces Node to use IPv4. This is the #1 fix for Railway/Cloud timeouts.
+// 1. Force IPv4 (Critical for stability)
 dns.setDefaultResultOrder('ipv4first');
 
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: STABILITY + SMART ALERTS (UP/DOWN)");
+console.log("🚀 VERSION: RESEND API + SMART ALERTS (UP/DOWN)");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -53,25 +52,9 @@ const SubscriberSchema = new mongoose.Schema({
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
-// --- 2. EMAIL TRANSPORTER (SSL FIX) ---
-// We use 'service: gmail' which forces Port 465 (SSL).
-// This is much more stable on cloud servers than Port 587.
-const transporter = nodemailer.createTransport({
-  service: 'gmail', 
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS, // MUST be your App Password
-  }
-});
-
-// Verify connection on startup
-transporter.verify((error, success) => {
-  if (error) {
-    console.error("❌ Email Connection Error:", error);
-  } else {
-    console.log("✅ Email Service is Ready (SSL Mode)");
-  }
-});
+// --- 2. RESEND CONFIGURATION ---
+// This uses HTTP (Port 443) which works everywhere (Render, Railway, Localhost)
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // --- HELPER: SEND ALERTS (HANDLES UP & DOWN) ---
 async function sendAlert(monitor, status) {
@@ -87,40 +70,42 @@ async function sendAlert(monitor, status) {
     ? `Great news! The service "${monitor.name}" (${monitor.url}) has recovered and is back online.`
     : `The service "${monitor.name}" (${monitor.url}) has been down for over 2 minutes. Please investigate.`;
 
-  console.log(`📧 Sending '${status}' alert for ${monitor.name} to ${subscribers.length} subscribers...`);
+  console.log(`📧 Sending '${status}' alert via Resend to ${subscribers.length} subscribers...`);
 
-  // We send individual emails using Promise.all to ensure everyone gets one
-  const promises = subscribers.map(sub => 
-    transporter.sendMail({
-      from: `"Uptime Monitor" <${process.env.SMTP_USER}>`,
-      to: sub.email,
+  try {
+    // IMPORTANT: On the free tier, 'from' MUST be 'onboarding@resend.dev'
+    // You can only send emails to yourself (the email you signed up with) unless you add a domain.
+    const { data, error } = await resend.emails.send({
+      from: 'onboarding@resend.dev', 
+      to: subscribers.map(s => s.email), 
       subject: subject,
       text: text
-    }).catch(err => console.error(`❌ Failed to send to ${sub.email}: ${err.message}`))
-  );
+    });
 
-  await Promise.all(promises);
-  console.log(`✅ Finished sending alerts for ${monitor.name}`);
+    if (error) {
+        console.error("❌ Resend API Error:", error);
+    } else {
+        console.log(`✅ Alert sent successfully! ID: ${data.id}`);
+    }
+  } catch (err) {
+    console.error("❌ Critical Email Error:", err.message);
+  }
 }
 
 // --- 3. SMART MONITORING LOGIC ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
-  // Ignores SSL certificate errors on the target site (good for dev sites)
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
     let currentStatus = 'down';
 
     try {
-      // 10s timeout + Custom User-Agent to prevent blocking
+      // 10s timeout + Custom User-Agent
       await axios.get(monitor.url, { 
         timeout: 10000, 
         httpsAgent: httpsAgent, 
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-          'Cache-Control': 'max-age=0'
-        }
+        headers: { 'User-Agent': 'UptimeBot/1.0' }
       });
       currentStatus = 'up';
     } catch (error) {
@@ -136,13 +121,13 @@ async function checkMonitors() {
       if (monitor.history.length > 500) monitor.history.shift();
 
       if (currentStatus === 'down') {
-        // Site just crashed: Start the timer, do NOT alert yet.
+        // Site just crashed: Start timer, don't alert yet
         monitor.downSince = new Date();
         monitor.alertSent = false;
       } else {
-        // Site just recovered:
+        // Site just recovered
         monitor.downSince = null;
-        // If we had previously sent a DOWN alert, send a RECOVERY alert now
+        // If we previously sent a DOWN alert, send RECOVERY alert now
         if (monitor.alertSent) {
            await sendAlert(monitor, 'up');
         }
@@ -154,10 +139,8 @@ async function checkMonitors() {
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
       
-      // Log progress for debugging
       if (minutesDown > 0.5) console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
 
-      // Trigger Alert after 2 minutes
       if (minutesDown >= 2) {
         console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
         
@@ -165,7 +148,7 @@ async function checkMonitors() {
         monitor.alertSent = true;
         await monitor.save();
 
-        // 2. Send the 'DOWN' email
+        // 2. Send the 'DOWN' email via Resend
         await sendAlert(monitor, 'down');
       }
     }
@@ -178,7 +161,12 @@ async function checkMonitors() {
 // Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-// --- API ROUTES (UNCHANGED) ---
+// Keep-Alive Route (Helpful for Render)
+app.get('/', (req, res) => {
+    res.send('Uptime Monitor is Running 🟢');
+});
+
+// --- API ROUTES ---
 app.get('/monitors', async (req, res) => {
   try {
     const monitors = await Monitor.find();
@@ -214,23 +202,26 @@ app.get('/subscribers', async (req, res) => {
   res.json({ count });
 });
 
+// Test Email Route
 app.get('/api/test-email', async (req, res) => {
     try {
-        console.log("🧪 Starting Email Test...");
-        if (!process.env.SMTP_PASS) throw new Error("SMTP_PASS is MISSING!");
-        
-        let info = await transporter.sendMail({
-            from: process.env.SMTP_USER,
-            to: process.env.SMTP_USER, 
-            subject: "Test Email from Railway",
-            text: "Port 465/SSL Fix Applied! 🎉"
+        console.log("🧪 Starting Resend Test...");
+        const { data, error } = await resend.emails.send({
+            from: 'onboarding@resend.dev',
+            to: 'your-email@gmail.com', // Replace with your actual email for manual testing
+            subject: "Test from Resend",
+            text: "It works! 🎉"
         });
 
-        console.log("✅ Email Test Success:", info.response);
-        res.json({ success: true, message: "Email Sent!", details: info.response });
-    } catch (error) {
-        console.error("❌ Email Test Failed:", error);
-        res.status(500).json({ error: error.message });
+        if (error) {
+            console.error("❌ Resend Error:", error);
+            return res.status(500).json({ error });
+        }
+        
+        console.log("✅ Resend Success:", data);
+        res.json({ success: true, data });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
     } 
 });
 
