@@ -5,7 +5,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const https = require('https');
 const dns = require('node:dns');
-const { Resend } = require('resend'); // ✅ NEW: Using Resend
+const { Resend } = require('resend');
 
 // 1. Force IPv4 (Critical for stability)
 dns.setDefaultResultOrder('ipv4first');
@@ -13,7 +13,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: RESEND API + SMART ALERTS (UP/DOWN)");
+console.log("🚀 VERSION: SUBSCRIBER MANAGER + RESEND API");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -52,11 +52,10 @@ const SubscriberSchema = new mongoose.Schema({
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 
-// --- 2. RESEND CONFIGURATION ---
-// This uses HTTP (Port 443) which works everywhere (Render, Railway, Localhost)
+// --- RESEND CONFIGURATION ---
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- HELPER: SEND ALERTS (HANDLES UP & DOWN) ---
+// --- HELPER: SEND ALERTS ---
 async function sendAlert(monitor, status) {
   const subscribers = await Subscriber.find();
   if (subscribers.length === 0) return;
@@ -73,8 +72,7 @@ async function sendAlert(monitor, status) {
   console.log(`📧 Sending '${status}' alert via Resend to ${subscribers.length} subscribers...`);
 
   try {
-    // IMPORTANT: On the free tier, 'from' MUST be 'onboarding@resend.dev'
-    // You can only send emails to yourself (the email you signed up with) unless you add a domain.
+    // IMPORTANT: 'from' must be 'onboarding@resend.dev' on Free Tier
     const { data, error } = await resend.emails.send({
       from: 'onboarding@resend.dev', 
       to: subscribers.map(s => s.email), 
@@ -92,7 +90,7 @@ async function sendAlert(monitor, status) {
   }
 }
 
-// --- 3. SMART MONITORING LOGIC ---
+// --- SMART MONITORING LOGIC ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
@@ -101,7 +99,6 @@ async function checkMonitors() {
     let currentStatus = 'down';
 
     try {
-      // 10s timeout + Custom User-Agent
       await axios.get(monitor.url, { 
         timeout: 10000, 
         httpsAgent: httpsAgent, 
@@ -112,7 +109,6 @@ async function checkMonitors() {
       currentStatus = 'down';
     }
 
-    // --- LOGIC A: STATUS CHANGE ---
     if (monitor.status !== currentStatus) {
       console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
       
@@ -121,50 +117,34 @@ async function checkMonitors() {
       if (monitor.history.length > 500) monitor.history.shift();
 
       if (currentStatus === 'down') {
-        // Site just crashed: Start timer, don't alert yet
         monitor.downSince = new Date();
         monitor.alertSent = false;
       } else {
-        // Site just recovered
         monitor.downSince = null;
-        // If we previously sent a DOWN alert, send RECOVERY alert now
-        if (monitor.alertSent) {
-           await sendAlert(monitor, 'up');
-        }
+        if (monitor.alertSent) await sendAlert(monitor, 'up');
         monitor.alertSent = false;
       }
     }
 
-    // --- LOGIC B: PERSISTENT DOWNTIME (The 2-Minute Rule) ---
     if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
       const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-      
       if (minutesDown > 0.5) console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
 
       if (minutesDown >= 2) {
         console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
-        
-        // 1. Mark as sent FIRST to prevent loops
         monitor.alertSent = true;
         await monitor.save();
-
-        // 2. Send the 'DOWN' email via Resend
         await sendAlert(monitor, 'down');
       }
     }
-
     monitor.lastChecked = new Date();
     await monitor.save();
   }
 }
 
-// Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-// Keep-Alive Route (Helpful for Render)
-app.get('/', (req, res) => {
-    res.send('Uptime Monitor is Running 🟢');
-});
+app.get('/', (req, res) => { res.send('Uptime Monitor is Running 🟢'); });
 
 // --- API ROUTES ---
 app.get('/monitors', async (req, res) => {
@@ -188,6 +168,9 @@ app.delete('/monitors/:id', async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
+// --- UPDATED SUBSCRIBER ROUTES ---
+
+// 1. Add Subscriber
 app.post('/subscribers', async (req, res) => {
   try {
     const { email } = req.body;
@@ -197,32 +180,21 @@ app.post('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// 2. GET All Subscribers (Now returns list, not just count)
 app.get('/subscribers', async (req, res) => {
-  const count = await Subscriber.countDocuments();
-  res.json({ count });
+  try {
+    const subscribers = await Subscriber.find();
+    res.json(subscribers);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Test Email Route
-app.get('/api/test-email', async (req, res) => {
+// 3. DELETE Subscriber (Fix for Resend error)
+app.delete('/subscribers', async (req, res) => {
     try {
-        console.log("🧪 Starting Resend Test...");
-        const { data, error } = await resend.emails.send({
-            from: 'onboarding@resend.dev',
-            to: 'your-email@gmail.com', // Replace with your actual email for manual testing
-            subject: "Test from Resend",
-            text: "It works! 🎉"
-        });
-
-        if (error) {
-            console.error("❌ Resend Error:", error);
-            return res.status(500).json({ error });
-        }
-        
-        console.log("✅ Resend Success:", data);
-        res.json({ success: true, data });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    } 
+        const { email } = req.body;
+        await Subscriber.deleteOne({ email });
+        res.json({ message: 'Deleted subscriber' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
