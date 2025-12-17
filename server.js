@@ -13,7 +13,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: SUBSCRIBER MANAGER + RESEND API");
+console.log("🚀 VERSION: CRASH PROOF + RESEND API");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -72,7 +72,6 @@ async function sendAlert(monitor, status) {
   console.log(`📧 Sending '${status}' alert via Resend to ${subscribers.length} subscribers...`);
 
   try {
-    // IMPORTANT: 'from' must be 'onboarding@resend.dev' on Free Tier
     const { data, error } = await resend.emails.send({
       from: 'onboarding@resend.dev', 
       to: subscribers.map(s => s.email), 
@@ -90,61 +89,83 @@ async function sendAlert(monitor, status) {
   }
 }
 
-// --- SMART MONITORING LOGIC ---
+// --- 3. SMART MONITORING LOGIC (UPDATED WITH CRASH FIX) ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
-    let currentStatus = 'down';
-
+    // 🔥 THE FIX: We wrap the logic for EACH monitor in a try-catch block.
+    // If a monitor is deleted while checking, the error is caught here
+    // and the server does NOT crash.
     try {
-      await axios.get(monitor.url, { 
-        timeout: 10000, 
-        httpsAgent: httpsAgent, 
-        headers: { 'User-Agent': 'UptimeBot/1.0' }
-      });
-      currentStatus = 'up';
-    } catch (error) {
-      currentStatus = 'down';
-    }
+      let currentStatus = 'down';
 
-    if (monitor.status !== currentStatus) {
-      console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
-      
-      monitor.status = currentStatus;
-      monitor.history.push({ status: currentStatus, timestamp: new Date() });
-      if (monitor.history.length > 500) monitor.history.shift();
+      try {
+        await axios.get(monitor.url, { 
+          timeout: 10000, 
+          httpsAgent: httpsAgent, 
+          headers: { 'User-Agent': 'UptimeBot/1.0' }
+        });
+        currentStatus = 'up';
+      } catch (error) {
+        currentStatus = 'down';
+      }
 
-      if (currentStatus === 'down') {
-        monitor.downSince = new Date();
-        monitor.alertSent = false;
+      // --- LOGIC A: STATUS CHANGE ---
+      if (monitor.status !== currentStatus) {
+        console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
+        
+        monitor.status = currentStatus;
+        monitor.history.push({ status: currentStatus, timestamp: new Date() });
+        if (monitor.history.length > 500) monitor.history.shift();
+
+        if (currentStatus === 'down') {
+          monitor.downSince = new Date();
+          monitor.alertSent = false;
+        } else {
+          monitor.downSince = null;
+          if (monitor.alertSent) await sendAlert(monitor, 'up');
+          monitor.alertSent = false;
+        }
+      }
+
+      // --- LOGIC B: PERSISTENT DOWNTIME (The 2-Minute Rule) ---
+      if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
+        const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
+        
+        if (minutesDown > 0.5) console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
+
+        if (minutesDown >= 2) {
+          console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
+          
+          monitor.alertSent = true;
+          await monitor.save(); // Note: This might fail if deleted, but the outer catch handles it!
+          await sendAlert(monitor, 'down');
+        }
+      }
+
+      monitor.lastChecked = new Date();
+      await monitor.save();
+
+    } catch (err) {
+      // ✅ This block handles the "DocumentNotFoundError" so the server stays alive
+      if (err.name === 'DocumentNotFoundError' || err.message.includes('No document found')) {
+        console.log(`⚠️ Skipped saving "${monitor.name}" because it was deleted.`);
       } else {
-        monitor.downSince = null;
-        if (monitor.alertSent) await sendAlert(monitor, 'up');
-        monitor.alertSent = false;
+        console.error(`❌ Unexpected error for ${monitor.name}:`, err.message);
       }
     }
-
-    if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
-      const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-      if (minutesDown > 0.5) console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
-
-      if (minutesDown >= 2) {
-        console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
-        monitor.alertSent = true;
-        await monitor.save();
-        await sendAlert(monitor, 'down');
-      }
-    }
-    monitor.lastChecked = new Date();
-    await monitor.save();
   }
 }
 
+// Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-app.get('/', (req, res) => { res.send('Uptime Monitor is Running 🟢'); });
+// Keep-Alive Route (Helpful for Render)
+app.get('/', (req, res) => {
+    res.send('Uptime Monitor is Running 🟢');
+});
 
 // --- API ROUTES ---
 app.get('/monitors', async (req, res) => {
@@ -168,7 +189,7 @@ app.delete('/monitors/:id', async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- UPDATED SUBSCRIBER ROUTES ---
+// --- SUBSCRIBER ROUTES ---
 
 // 1. Add Subscriber
 app.post('/subscribers', async (req, res) => {
@@ -180,7 +201,7 @@ app.post('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. GET All Subscribers (Now returns list, not just count)
+// 2. GET All Subscribers (List)
 app.get('/subscribers', async (req, res) => {
   try {
     const subscribers = await Subscriber.find();
@@ -188,13 +209,36 @@ app.get('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. DELETE Subscriber (Fix for Resend error)
+// 3. DELETE Subscriber
 app.delete('/subscribers', async (req, res) => {
     try {
         const { email } = req.body;
         await Subscriber.deleteOne({ email });
         res.json({ message: 'Deleted subscriber' });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Test Email Route
+app.get('/api/test-email', async (req, res) => {
+    try {
+        console.log("🧪 Starting Resend Test...");
+        const { data, error } = await resend.emails.send({
+            from: 'onboarding@resend.dev',
+            to: 'your-email@gmail.com', // Replace with your actual email for manual testing
+            subject: 'Test from Resend',
+            text: 'It works! 🎉'
+        });
+
+        if (error) {
+            console.error("❌ Resend Error:", error);
+            return res.status(500).json({ error });
+        }
+        
+        console.log("✅ Resend Success:", data);
+        res.json({ success: true, data });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    } 
 });
 
 app.listen(PORT, '0.0.0.0', () => {
