@@ -57,38 +57,40 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 // --- HELPER: RAW TCP CHECK (Fixed Deprecation Warning) ---
+// --- HELPER: RAW TCP CHECK (DEBUG MODE) ---
 function checkTcp(targetUrl) {
     return new Promise((resolve) => {
         try {
-            // Ensure protocol exists for the URL parser
             const cleanUrl = targetUrl.startsWith('http') ? targetUrl : `http://${targetUrl}`;
-            
-            // ✅ THE FIX: Use 'new URL()' instead of 'url.parse()'
             const parsed = new URL(cleanUrl);
-            
             const host = parsed.hostname;
-            // Default port: 443 for https, 80 for http, or use specified port
             const port = parsed.port || (cleanUrl.startsWith('https') ? 443 : 80);
+
+            console.log(`🔎 Checking TCP: ${host} on Port ${port}...`); // <--- Log what we are checking
 
             const socket = new net.Socket();
             socket.setTimeout(5000); 
 
             socket.connect(port, host, () => {
+                console.log(`✅ TCP Success for ${host}:${port}`);
                 socket.end();
-                resolve(true); // ✅ Port is Open
+                resolve(true); 
             });
 
-            socket.on('error', () => {
+            socket.on('error', (err) => {
+                console.log(`❌ TCP Error for ${host}:${port} -> ${err.code}`); // <--- See the exact error code
                 socket.destroy();
-                resolve(false); // ❌ Connection Failed
+                resolve(false); 
             });
 
             socket.on('timeout', () => {
+                console.log(`❌ TCP Timeout for ${host}:${port} (Firewall?)`); // <--- Timeout means blocked
                 socket.destroy();
-                resolve(false); // ❌ Timeout
+                resolve(false); 
             });
 
         } catch (e) {
+            console.log(`❌ URL Parse Error: ${e.message}`);
             resolve(false);
         }
     });
