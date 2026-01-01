@@ -5,8 +5,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const https = require('https');
 const dns = require('node:dns');
-const net = require('net'); // ✅ NEW: For TCP Port Checking
-const urlModule = require('url'); // ✅ NEW: To parse IPs
+const net = require('net'); 
 const { Resend } = require('resend');
 
 // 1. Force IPv4 (Critical for stability)
@@ -15,7 +14,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: HYBRID MONITOR + CRASH PROOF + RESEND");
+console.log("🚀 VERSION: FINAL STABLE (NO WARNINGS)");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -57,24 +56,26 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 // --- RESEND CONFIGURATION ---
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- HELPER: RAW TCP CHECK (For non-web ports like 22222) ---
+// --- HELPER: RAW TCP CHECK (Fixed Deprecation Warning) ---
 function checkTcp(targetUrl) {
     return new Promise((resolve) => {
         try {
-            // Handle cases where user just types "1.1.1.1:80" without http://
+            // Ensure protocol exists for the URL parser
             const cleanUrl = targetUrl.startsWith('http') ? targetUrl : `http://${targetUrl}`;
-            const parsed = urlModule.parse(cleanUrl);
+            
+            // ✅ THE FIX: Use 'new URL()' instead of 'url.parse()'
+            const parsed = new URL(cleanUrl);
             
             const host = parsed.hostname;
-            // Default to 80 if no port specified, or use the one in URL
+            // Default port: 443 for https, 80 for http, or use specified port
             const port = parsed.port || (cleanUrl.startsWith('https') ? 443 : 80);
 
             const socket = new net.Socket();
-            socket.setTimeout(5000); // 5 second timeout
+            socket.setTimeout(5000); 
 
             socket.connect(port, host, () => {
                 socket.end();
-                resolve(true); // ✅ Connection Success! Port is Open.
+                resolve(true); // ✅ Port is Open
             });
 
             socket.on('error', () => {
@@ -127,13 +128,12 @@ async function sendAlert(monitor, status) {
   }
 }
 
-// --- SMART MONITORING LOGIC (HYBRID + CRASH PROOF) ---
+// --- SMART MONITORING LOGIC ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
-    // 🔥 CRASH PROOF: Wraps logic in try/catch to handle deleted monitors
     try {
       let currentStatus = 'down';
 
@@ -144,18 +144,18 @@ async function checkMonitors() {
           httpsAgent: httpsAgent, 
           headers: { 'User-Agent': 'UptimeBot/1.0' }
         });
-        currentStatus = 'up'; // ✅ HTTP Success
+        currentStatus = 'up'; 
       } catch (httpError) {
         
         // STEP 2: HTTP Failed? Try TCP Port Check (Fallback)
-        console.log(`⚠️ HTTP failed for ${monitor.name}. Trying TCP Port Check...`);
+        // I removed the console.log spam here so logs are cleaner
         const isPortOpen = await checkTcp(monitor.url);
         
         if (isPortOpen) {
-            console.log(`✅ TCP Port Open! Marking ${monitor.name} as UP.`);
+            // Only log if we saved it via TCP
+            console.log(`⚠️ HTTP failed for ${monitor.name}, but TCP is OPEN. Marking UP.`);
             currentStatus = 'up';
         } else {
-            // console.log(`❌ TCP also failed. ${monitor.name} is definitely DOWN.`);
             currentStatus = 'down';
         }
       }
@@ -178,7 +178,7 @@ async function checkMonitors() {
         }
       }
 
-      // --- LOGIC B: PERSISTENT DOWNTIME (The 2-Minute Rule) ---
+      // --- 2-MINUTE ALERT LOGIC ---
       if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
         const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
         
@@ -197,7 +197,6 @@ async function checkMonitors() {
       await monitor.save();
 
     } catch (err) {
-      // ✅ CRASH PROOF: Handles deleted documents gracefully
       if (err.name === 'DocumentNotFoundError' || err.message.includes('No document found')) {
         console.log(`⚠️ Skipped saving "${monitor.name}" because it was deleted.`);
       } else {
@@ -235,7 +234,6 @@ app.delete('/monitors/:id', async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- SUBSCRIBER ROUTES ---
 app.post('/subscribers', async (req, res) => {
   try {
     const { email } = req.body;
