@@ -5,6 +5,8 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const https = require('https');
 const dns = require('node:dns');
+const net = require('net'); // ✅ NEW: For TCP Port Checking
+const urlModule = require('url'); // ✅ NEW: To parse IPs
 const { Resend } = require('resend');
 
 // 1. Force IPv4 (Critical for stability)
@@ -13,7 +15,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: CRASH PROOF + RESEND API");
+console.log("🚀 VERSION: HYBRID MONITOR + CRASH PROOF + RESEND");
 console.log("------------------------------------------------");
 
 const app = express();
@@ -55,6 +57,42 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 // --- RESEND CONFIGURATION ---
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// --- HELPER: RAW TCP CHECK (For non-web ports like 22222) ---
+function checkTcp(targetUrl) {
+    return new Promise((resolve) => {
+        try {
+            // Handle cases where user just types "1.1.1.1:80" without http://
+            const cleanUrl = targetUrl.startsWith('http') ? targetUrl : `http://${targetUrl}`;
+            const parsed = urlModule.parse(cleanUrl);
+            
+            const host = parsed.hostname;
+            // Default to 80 if no port specified, or use the one in URL
+            const port = parsed.port || (cleanUrl.startsWith('https') ? 443 : 80);
+
+            const socket = new net.Socket();
+            socket.setTimeout(5000); // 5 second timeout
+
+            socket.connect(port, host, () => {
+                socket.end();
+                resolve(true); // ✅ Connection Success! Port is Open.
+            });
+
+            socket.on('error', () => {
+                socket.destroy();
+                resolve(false); // ❌ Connection Failed
+            });
+
+            socket.on('timeout', () => {
+                socket.destroy();
+                resolve(false); // ❌ Timeout
+            });
+
+        } catch (e) {
+            resolve(false);
+        }
+    });
+}
+
 // --- HELPER: SEND ALERTS ---
 async function sendAlert(monitor, status) {
   const subscribers = await Subscriber.find();
@@ -89,30 +127,40 @@ async function sendAlert(monitor, status) {
   }
 }
 
-// --- 3. SMART MONITORING LOGIC (UPDATED WITH CRASH FIX) ---
+// --- SMART MONITORING LOGIC (HYBRID + CRASH PROOF) ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
-    // 🔥 THE FIX: We wrap the logic for EACH monitor in a try-catch block.
-    // If a monitor is deleted while checking, the error is caught here
-    // and the server does NOT crash.
+    // 🔥 CRASH PROOF: Wraps logic in try/catch to handle deleted monitors
     try {
       let currentStatus = 'down';
 
+      // STEP 1: Try Standard HTTP Request
       try {
         await axios.get(monitor.url, { 
-          timeout: 10000, 
+          timeout: 5000, 
           httpsAgent: httpsAgent, 
           headers: { 'User-Agent': 'UptimeBot/1.0' }
         });
-        currentStatus = 'up';
-      } catch (error) {
-        currentStatus = 'down';
+        currentStatus = 'up'; // ✅ HTTP Success
+      } catch (httpError) {
+        
+        // STEP 2: HTTP Failed? Try TCP Port Check (Fallback)
+        console.log(`⚠️ HTTP failed for ${monitor.name}. Trying TCP Port Check...`);
+        const isPortOpen = await checkTcp(monitor.url);
+        
+        if (isPortOpen) {
+            console.log(`✅ TCP Port Open! Marking ${monitor.name} as UP.`);
+            currentStatus = 'up';
+        } else {
+            // console.log(`❌ TCP also failed. ${monitor.name} is definitely DOWN.`);
+            currentStatus = 'down';
+        }
       }
 
-      // --- LOGIC A: STATUS CHANGE ---
+      // --- STATUS CHANGE LOGIC ---
       if (monitor.status !== currentStatus) {
         console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
         
@@ -140,7 +188,7 @@ async function checkMonitors() {
           console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
           
           monitor.alertSent = true;
-          await monitor.save(); // Note: This might fail if deleted, but the outer catch handles it!
+          await monitor.save(); 
           await sendAlert(monitor, 'down');
         }
       }
@@ -149,7 +197,7 @@ async function checkMonitors() {
       await monitor.save();
 
     } catch (err) {
-      // ✅ This block handles the "DocumentNotFoundError" so the server stays alive
+      // ✅ CRASH PROOF: Handles deleted documents gracefully
       if (err.name === 'DocumentNotFoundError' || err.message.includes('No document found')) {
         console.log(`⚠️ Skipped saving "${monitor.name}" because it was deleted.`);
       } else {
@@ -162,10 +210,8 @@ async function checkMonitors() {
 // Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-// Keep-Alive Route (Helpful for Render)
-app.get('/', (req, res) => {
-    res.send('Uptime Monitor is Running 🟢');
-});
+// Keep-Alive Route
+app.get('/', (req, res) => { res.send('Uptime Monitor is Running 🟢'); });
 
 // --- API ROUTES ---
 app.get('/monitors', async (req, res) => {
@@ -190,8 +236,6 @@ app.delete('/monitors/:id', async (req, res) => {
 });
 
 // --- SUBSCRIBER ROUTES ---
-
-// 1. Add Subscriber
 app.post('/subscribers', async (req, res) => {
   try {
     const { email } = req.body;
@@ -201,7 +245,6 @@ app.post('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 2. GET All Subscribers (List)
 app.get('/subscribers', async (req, res) => {
   try {
     const subscribers = await Subscriber.find();
@@ -209,7 +252,6 @@ app.get('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 3. DELETE Subscriber
 app.delete('/subscribers', async (req, res) => {
     try {
         const { email } = req.body;
@@ -224,7 +266,7 @@ app.get('/api/test-email', async (req, res) => {
         console.log("🧪 Starting Resend Test...");
         const { data, error } = await resend.emails.send({
             from: 'onboarding@resend.dev',
-            to: 'your-email@gmail.com', // Replace with your actual email for manual testing
+            to: 'your-email@gmail.com', 
             subject: 'Test from Resend',
             text: 'It works! 🎉'
         });
