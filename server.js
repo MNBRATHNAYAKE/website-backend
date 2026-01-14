@@ -1,4 +1,4 @@
-// server.js (Cloud Backend with Edge Support)
+// server.js (FINAL: Edge + Auth + Resend)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -7,6 +7,8 @@ const https = require('https');
 const dns = require('node:dns');
 const net = require('net'); 
 const { Resend } = require('resend');
+const bcrypt = require('bcryptjs'); // ✅ NEW: For Password Hashing
+const jwt = require('jsonwebtoken'); // ✅ NEW: For Login Tokens
 
 // 1. Force IPv4 (Critical for stability)
 dns.setDefaultResultOrder('ipv4first');
@@ -14,12 +16,12 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: CLOUD + EDGE PROBE API");
+console.log("🚀 VERSION: FINAL (AUTH + EDGE + RESEND)");
 console.log("------------------------------------------------");
 
-// 🔥 CONFIG: Monitors that should ONLY be checked by your laptop (Edge Node)
-// The cloud server will SKIP these to avoid "Firewall/Timeout" errors.
+// 🔥 CONFIG: Edge Monitors (Handled by Laptop)
 const EDGE_MONITORS = ["slpost", "Finger print", "MORS", "mms"]; 
+const JWT_SECRET = process.env.JWT_SECRET || "change-this-to-something-secret";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -36,7 +38,15 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
-// Schemas
+// --- SCHEMAS ---
+
+// 1. ✅ User Schema (For Login)
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true }
+});
+
+// 2. Monitor Schema
 const MonitorSchema = new mongoose.Schema({
   name: String,
   url: String,
@@ -50,17 +60,71 @@ const MonitorSchema = new mongoose.Schema({
   }]
 });
 
+// 3. Subscriber Schema
 const SubscriberSchema = new mongoose.Schema({
   email: { type: String, unique: true, required: true }
 });
 
+const User = mongoose.model('User', UserSchema);
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
-
-// --- RESEND CONFIGURATION ---
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- HELPER: RAW TCP CHECK (Modern URL API) ---
+// --- 🔒 MIDDLEWARE: PROTECT ROUTES ---
+const auth = (req, res, next) => {
+  const token = req.header('x-auth-token');
+  
+  // Allow Edge Node updates without user token
+  if (req.path === '/api/edge-update') return next();
+
+  if (!token) return res.status(401).json({ msg: 'No token, authorization denied' });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    res.status(400).json({ msg: 'Token is not valid' });
+  }
+};
+
+// --- AUTH ROUTES ---
+
+// 1. Register (Use this once to create your account)
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    let user = await User.findOne({ email });
+    if (user) return res.status(400).json({ msg: 'User already exists' });
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    user = new User({ email, password: hashedPassword });
+    await user.save();
+
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '1h' });
+    res.json({ token, user: { id: user._id, email: user.email } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 2. Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ msg: 'User does not exist' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, user: { id: user._id, email: user.email } });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- HELPERS ---
+
 function checkTcp(targetUrl) {
     return new Promise((resolve) => {
         try {
@@ -84,7 +148,6 @@ function checkTcp(targetUrl) {
     });
 }
 
-// --- HELPER: SEND ALERTS ---
 async function sendAlert(monitor, status) {
   const subscribers = await Subscriber.find();
   if (subscribers.length === 0) return;
@@ -95,8 +158,8 @@ async function sendAlert(monitor, status) {
     : `🚨 ALERT: ${monitor.name} is DOWN`;
   
   const text = isUp
-    ? `Great news! The service "${monitor.name}" is back online.`
-    : `The service "${monitor.name}" is DOWN. Please investigate.`;
+    ? `Great news! The service "${monitor.name}" (${monitor.url}) has recovered and is back online.`
+    : `The service "${monitor.name}" (${monitor.url}) has been down for over 2 minutes. Please investigate.`;
 
   console.log(`📧 Sending '${status}' alert via Resend to ${subscribers.length} subscribers...`);
 
@@ -114,9 +177,7 @@ async function sendAlert(monitor, status) {
   }
 }
 
-// --- HELPER: SHARED UPDATE LOGIC (Used by Cloud Loop & Edge API) ---
 async function updateMonitorStatus(monitor, currentStatus) {
-    // Only update/save if status changes OR for periodic timestamp updates
     if (monitor.status !== currentStatus) {
         console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
         
@@ -158,12 +219,8 @@ async function checkMonitors() {
 
   for (const monitor of monitors) {
     try {
-      // 🛑 STEP 0: Check if this is an "Edge Monitor"
-      // If the name is in our list, we SKIP it here. The laptop will handle it.
-      if (EDGE_MONITORS.includes(monitor.name)) {
-          // console.log(`⏩ Skipping ${monitor.name} (Waiting for Edge Node)`);
-          continue; 
-      }
+      // 🛑 SKIP EDGE MONITORS (Your laptop handles these)
+      if (EDGE_MONITORS.includes(monitor.name)) continue; 
 
       let currentStatus = 'down';
 
@@ -186,11 +243,10 @@ async function checkMonitors() {
         }
       }
 
-      // Update Database using shared helper
       await updateMonitorStatus(monitor, currentStatus);
 
     } catch (err) {
-      if (err.name === 'DocumentNotFoundError' || err.message.includes('No document found')) {
+      if (err.name === 'DocumentNotFoundError') {
         console.log(`⚠️ Skipped saving "${monitor.name}" because it was deleted.`);
       } else {
         console.error(`❌ Unexpected error for ${monitor.name}:`, err.message);
@@ -202,57 +258,15 @@ async function checkMonitors() {
 // Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
-// --- 🔌 NEW API ROUTE FOR YOUR LAPTOP (EDGE NODE) ---
-app.post('/api/edge-update', async (req, res) => {
-    try {
-        const { name, status } = req.body; 
-        
-        const monitor = await Monitor.findOne({ name });
-        if (!monitor) return res.status(404).json({ error: "Monitor not found" });
+// --- ROUTES ---
 
-        console.log(`🔌 Edge Node Reported: ${name} is ${status.toUpperCase()}`);
-        
-        // Use the same robust logic to save history and send alerts
-        await updateMonitorStatus(monitor, status);
-        
-        res.json({ success: true });
-    } catch (e) {
-        console.error("Edge Update Error:", e);
-        res.status(500).json({ error: e.message });
-    }
-});
+// Public Route (View Only)
+app.get('/', (req, res) => res.send('Uptime Monitor is Running 🟢'));
 
-// Keep-Alive Route
-app.get('/', (req, res) => { res.send('Uptime Monitor is Running 🟢'); });
-
-// --- STANDARD API ROUTES ---
 app.get('/monitors', async (req, res) => {
   try {
     const monitors = await Monitor.find();
     res.json(monitors);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/monitors', async (req, res) => {
-  try {
-    const { name, url } = req.body;
-    const newMonitor = new Monitor({ name, url, status: 'unknown', history: [] });
-    await newMonitor.save();
-    res.json(newMonitor);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.delete('/monitors/:id', async (req, res) => {
-  await Monitor.findByIdAndDelete(req.params.id);
-  res.json({ message: 'Deleted' });
-});
-
-app.post('/subscribers', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email || !email.includes('@')) return res.status(400).json({error: 'Invalid email'});
-    await Subscriber.updateOne({ email }, { email }, { upsert: true });
-    res.json({ message: 'Subscribed' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -263,12 +277,55 @@ app.get('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/subscribers', async (req, res) => {
+// Edge Node Route (No Auth Required)
+app.post('/api/edge-update', async (req, res) => {
+    try {
+        const { name, status } = req.body; 
+        
+        const monitor = await Monitor.findOne({ name });
+        if (!monitor) return res.status(404).json({ error: "Monitor not found" });
+
+        console.log(`🔌 Edge Node Reported: ${name} is ${status.toUpperCase()}`);
+        await updateMonitorStatus(monitor, status);
+        
+        res.json({ success: true });
+    } catch (e) {
+        console.error("Edge Update Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// 🔒 PROTECTED ROUTES (Require Login)
+app.post('/monitors', auth, async (req, res) => { // <--- 'auth' middleware added
+  try {
+    const { name, url } = req.body;
+    const newMonitor = new Monitor({ name, url, status: 'unknown', history: [] });
+    await newMonitor.save();
+    res.json(newMonitor);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/monitors/:id', auth, async (req, res) => { // <--- 'auth' middleware added
+  await Monitor.findByIdAndDelete(req.params.id);
+  res.json({ message: 'Deleted' });
+});
+
+app.delete('/subscribers', auth, async (req, res) => { // <--- 'auth' middleware added
     try {
         const { email } = req.body;
         await Subscriber.deleteOne({ email });
         res.json({ message: 'Deleted subscriber' });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Public Route for Subscription (Anyone can subscribe)
+app.post('/subscribers', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !email.includes('@')) return res.status(400).json({error: 'Invalid email'});
+    await Subscriber.updateOne({ email }, { email }, { upsert: true });
+    res.json({ message: 'Subscribed' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Test Email Route
@@ -281,12 +338,10 @@ app.get('/api/test-email', async (req, res) => {
             subject: 'Test from Resend',
             text: 'It works! 🎉'
         });
-
         if (error) {
             console.error("❌ Resend Error:", error);
             return res.status(500).json({ error });
         }
-        
         console.log("✅ Resend Success:", data);
         res.json({ success: true, data });
     } catch (e) {
