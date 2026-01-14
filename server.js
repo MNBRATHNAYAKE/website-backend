@@ -1,4 +1,4 @@
-// server.js (FINAL: Edge + Auth + Resend + Admin Key + User Management)
+// server.js (FINAL: Edge + Auth + Resend + SUPER ADMIN LOCK)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -16,13 +16,14 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: FINAL COMPLETED (WITH USER MANAGER)");
+console.log("🚀 VERSION: SUPER ADMIN MODE (LOCKED TO NUWAN)");
 console.log("------------------------------------------------");
 
 // 🔥 CONFIG
 const EDGE_MONITORS = ["slpost", "Finger print", "MORS", "mms"]; 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-to-something-secret";
-const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || "nuwan-secure-2026"; // 🔒 The Master Key
+const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || "nuwan-secure-2026"; 
+const SUPER_ADMIN_EMAIL = "m.nuwan245@gmail.com"; // 🔒 LOCK: Only this email can delete users
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -71,7 +72,7 @@ const auth = (req, res, next) => {
   if (!token) return res.status(401).json({ msg: 'No token, authorization denied' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    req.user = decoded; // Contains { id: ... }
     next();
   } catch (e) {
     res.status(400).json({ msg: 'Token is not valid' });
@@ -80,15 +81,11 @@ const auth = (req, res, next) => {
 
 // --- AUTH ROUTES ---
 
-// 1. Register (SECURED WITH ADMIN KEY)
+// 1. Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, adminKey } = req.body; 
-
-    // 🔒 Check Key
-    if (adminKey !== ADMIN_SECRET) {
-        return res.status(403).json({ msg: "Invalid Admin Secret Key. Registration Denied." });
-    }
+    if (adminKey !== ADMIN_SECRET) return res.status(403).json({ msg: "Invalid Admin Secret Key." });
 
     let user = await User.findOne({ email });
     if (user) return res.status(400).json({ msg: 'User already exists' });
@@ -209,7 +206,7 @@ app.post('/api/edge-update', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- 🔒 PROTECTED MONITOR ROUTES ---
+// 🔒 PROTECTED MONITOR ROUTES (Any Admin)
 app.post('/monitors', auth, async (req, res) => { 
   try {
     const { name, url } = req.body;
@@ -224,9 +221,17 @@ app.delete('/monitors/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- 🔒 PROTECTED USER MANAGEMENT ROUTES (NEW) ---
+// --- 🔒 SUPER ADMIN ONLY ROUTES (Restricted to Nuwan) ---
 app.get('/api/users', auth, async (req, res) => {
   try {
+    // 1. Fetch the actual user from DB to check email
+    const currentUser = await User.findById(req.user.id);
+    
+    // 2. Strict Email Check
+    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) {
+        return res.status(403).json({ msg: "Access Denied. Only the Super Admin can view users." });
+    }
+
     const users = await User.find().select('-password'); 
     res.json(users);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -234,6 +239,14 @@ app.get('/api/users', auth, async (req, res) => {
 
 app.delete('/api/users/:id', auth, async (req, res) => {
   try {
+    // 1. Fetch the actual user from DB
+    const currentUser = await User.findById(req.user.id);
+
+    // 2. Strict Email Check
+    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) {
+        return res.status(403).json({ msg: "Access Denied. Only the Super Admin can delete users." });
+    }
+
     if (req.user.id === req.params.id) {
         return res.status(400).json({ msg: "You cannot delete your own account." });
     }
