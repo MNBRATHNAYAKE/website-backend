@@ -1,4 +1,4 @@
-// server.js
+// server.js (Cloud Backend with Edge Support)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -14,8 +14,12 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: FINAL STABLE (NO WARNINGS)");
+console.log("🚀 VERSION: CLOUD + EDGE PROBE API");
 console.log("------------------------------------------------");
+
+// 🔥 CONFIG: Monitors that should ONLY be checked by your laptop (Edge Node)
+// The cloud server will SKIP these to avoid "Firewall/Timeout" errors.
+const EDGE_MONITORS = ["slpost", "Finger print", "MORS", "mms"]; 
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -56,8 +60,7 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 // --- RESEND CONFIGURATION ---
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- HELPER: RAW TCP CHECK (Fixed Deprecation Warning) ---
-// --- HELPER: RAW TCP CHECK (DEBUG MODE) ---
+// --- HELPER: RAW TCP CHECK (Modern URL API) ---
 function checkTcp(targetUrl) {
     return new Promise((resolve) => {
         try {
@@ -66,33 +69,18 @@ function checkTcp(targetUrl) {
             const host = parsed.hostname;
             const port = parsed.port || (cleanUrl.startsWith('https') ? 443 : 80);
 
-            console.log(`🔎 Checking TCP: ${host} on Port ${port}...`); // <--- Log what we are checking
-
             const socket = new net.Socket();
             socket.setTimeout(5000); 
 
             socket.connect(port, host, () => {
-                console.log(`✅ TCP Success for ${host}:${port}`);
                 socket.end();
                 resolve(true); 
             });
 
-            socket.on('error', (err) => {
-                console.log(`❌ TCP Error for ${host}:${port} -> ${err.code}`); // <--- See the exact error code
-                socket.destroy();
-                resolve(false); 
-            });
+            socket.on('error', () => { socket.destroy(); resolve(false); });
+            socket.on('timeout', () => { socket.destroy(); resolve(false); });
 
-            socket.on('timeout', () => {
-                console.log(`❌ TCP Timeout for ${host}:${port} (Firewall?)`); // <--- Timeout means blocked
-                socket.destroy();
-                resolve(false); 
-            });
-
-        } catch (e) {
-            console.log(`❌ URL Parse Error: ${e.message}`);
-            resolve(false);
-        }
+        } catch (e) { resolve(false); }
     });
 }
 
@@ -107,8 +95,8 @@ async function sendAlert(monitor, status) {
     : `🚨 ALERT: ${monitor.name} is DOWN`;
   
   const text = isUp
-    ? `Great news! The service "${monitor.name}" (${monitor.url}) has recovered and is back online.`
-    : `The service "${monitor.name}" (${monitor.url}) has been down for over 2 minutes. Please investigate.`;
+    ? `Great news! The service "${monitor.name}" is back online.`
+    : `The service "${monitor.name}" is DOWN. Please investigate.`;
 
   console.log(`📧 Sending '${status}' alert via Resend to ${subscribers.length} subscribers...`);
 
@@ -119,51 +107,17 @@ async function sendAlert(monitor, status) {
       subject: subject,
       text: text
     });
-
-    if (error) {
-        console.error("❌ Resend API Error:", error);
-    } else {
-        console.log(`✅ Alert sent successfully! ID: ${data.id}`);
-    }
+    if (error) console.error("❌ Resend API Error:", error);
+    else console.log(`✅ Alert sent successfully! ID: ${data.id}`);
   } catch (err) {
     console.error("❌ Critical Email Error:", err.message);
   }
 }
 
-// --- SMART MONITORING LOGIC ---
-async function checkMonitors() {
-  const monitors = await Monitor.find();
-  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-
-  for (const monitor of monitors) {
-    try {
-      let currentStatus = 'down';
-
-      // STEP 1: Try Standard HTTP Request
-      try {
-        await axios.get(monitor.url, { 
-          timeout: 5000, 
-          httpsAgent: httpsAgent, 
-          headers: { 'User-Agent': 'UptimeBot/1.0' }
-        });
-        currentStatus = 'up'; 
-      } catch (httpError) {
-        
-        // STEP 2: HTTP Failed? Try TCP Port Check (Fallback)
-        // I removed the console.log spam here so logs are cleaner
-        const isPortOpen = await checkTcp(monitor.url);
-        
-        if (isPortOpen) {
-            // Only log if we saved it via TCP
-            console.log(`⚠️ HTTP failed for ${monitor.name}, but TCP is OPEN. Marking UP.`);
-            currentStatus = 'up';
-        } else {
-            currentStatus = 'down';
-        }
-      }
-
-      // --- STATUS CHANGE LOGIC ---
-      if (monitor.status !== currentStatus) {
+// --- HELPER: SHARED UPDATE LOGIC (Used by Cloud Loop & Edge API) ---
+async function updateMonitorStatus(monitor, currentStatus) {
+    // Only update/save if status changes OR for periodic timestamp updates
+    if (monitor.status !== currentStatus) {
         console.log(`🔄 ${monitor.name} changed to ${currentStatus}`);
         
         monitor.status = currentStatus;
@@ -178,25 +132,62 @@ async function checkMonitors() {
           if (monitor.alertSent) await sendAlert(monitor, 'up');
           monitor.alertSent = false;
         }
-      }
+    }
 
-      // --- 2-MINUTE ALERT LOGIC ---
-      if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
+    // 2-MINUTE ALERT LOGIC
+    if (currentStatus === 'down' && monitor.downSince && !monitor.alertSent) {
         const minutesDown = (new Date() - new Date(monitor.downSince)) / 60000;
-        
         if (minutesDown > 0.5) console.log(`⏳ ${monitor.name} down for ${minutesDown.toFixed(1)} mins...`);
-
+        
         if (minutesDown >= 2) {
           console.log(`🚀 2 Minutes Reached! Sending Alert for ${monitor.name}`);
-          
           monitor.alertSent = true;
           await monitor.save(); 
           await sendAlert(monitor, 'down');
         }
+    }
+
+    monitor.lastChecked = new Date();
+    await monitor.save();
+}
+
+// --- SMART MONITORING LOOP (CLOUD) ---
+async function checkMonitors() {
+  const monitors = await Monitor.find();
+  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+  for (const monitor of monitors) {
+    try {
+      // 🛑 STEP 0: Check if this is an "Edge Monitor"
+      // If the name is in our list, we SKIP it here. The laptop will handle it.
+      if (EDGE_MONITORS.includes(monitor.name)) {
+          // console.log(`⏩ Skipping ${monitor.name} (Waiting for Edge Node)`);
+          continue; 
       }
 
-      monitor.lastChecked = new Date();
-      await monitor.save();
+      let currentStatus = 'down';
+
+      // STEP 1: HTTP Check
+      try {
+        await axios.get(monitor.url, { 
+          timeout: 5000, 
+          httpsAgent: httpsAgent, 
+          headers: { 'User-Agent': 'UptimeBot/1.0' }
+        });
+        currentStatus = 'up'; 
+      } catch (httpError) {
+        // STEP 2: TCP Fallback
+        const isPortOpen = await checkTcp(monitor.url);
+        if (isPortOpen) {
+            console.log(`⚠️ HTTP failed for ${monitor.name}, but TCP is OPEN. Marking UP.`);
+            currentStatus = 'up';
+        } else {
+            currentStatus = 'down';
+        }
+      }
+
+      // Update Database using shared helper
+      await updateMonitorStatus(monitor, currentStatus);
 
     } catch (err) {
       if (err.name === 'DocumentNotFoundError' || err.message.includes('No document found')) {
@@ -211,10 +202,30 @@ async function checkMonitors() {
 // Run check every 60 seconds
 setInterval(checkMonitors, 60000);
 
+// --- 🔌 NEW API ROUTE FOR YOUR LAPTOP (EDGE NODE) ---
+app.post('/api/edge-update', async (req, res) => {
+    try {
+        const { name, status } = req.body; 
+        
+        const monitor = await Monitor.findOne({ name });
+        if (!monitor) return res.status(404).json({ error: "Monitor not found" });
+
+        console.log(`🔌 Edge Node Reported: ${name} is ${status.toUpperCase()}`);
+        
+        // Use the same robust logic to save history and send alerts
+        await updateMonitorStatus(monitor, status);
+        
+        res.json({ success: true });
+    } catch (e) {
+        console.error("Edge Update Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // Keep-Alive Route
 app.get('/', (req, res) => { res.send('Uptime Monitor is Running 🟢'); });
 
-// --- API ROUTES ---
+// --- STANDARD API ROUTES ---
 app.get('/monitors', async (req, res) => {
   try {
     const monitors = await Monitor.find();
