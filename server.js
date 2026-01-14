@@ -1,4 +1,4 @@
-// server.js (FINAL: Edge + Auth + Resend + Admin Key Security)
+// server.js (FINAL: Edge + Auth + Resend + Admin Key + User Management)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -16,7 +16,7 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: FINAL SECURE (AUTH + EDGE + KEY CHECK)");
+console.log("🚀 VERSION: FINAL COMPLETED (WITH USER MANAGER)");
 console.log("------------------------------------------------");
 
 // 🔥 CONFIG
@@ -83,9 +83,9 @@ const auth = (req, res, next) => {
 // 1. Register (SECURED WITH ADMIN KEY)
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password, adminKey } = req.body; // <--- 1. Get Key
+    const { email, password, adminKey } = req.body; 
 
-    // 🔒 2. Check Key
+    // 🔒 Check Key
     if (adminKey !== ADMIN_SECRET) {
         return res.status(403).json({ msg: "Invalid Admin Secret Key. Registration Denied." });
     }
@@ -209,7 +209,7 @@ app.post('/api/edge-update', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🔒 PROTECTED
+// --- 🔒 PROTECTED MONITOR ROUTES ---
 app.post('/monitors', auth, async (req, res) => { 
   try {
     const { name, url } = req.body;
@@ -224,6 +224,25 @@ app.delete('/monitors/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
+// --- 🔒 PROTECTED USER MANAGEMENT ROUTES (NEW) ---
+app.get('/api/users', auth, async (req, res) => {
+  try {
+    const users = await User.find().select('-password'); 
+    res.json(users);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/users/:id', auth, async (req, res) => {
+  try {
+    if (req.user.id === req.params.id) {
+        return res.status(400).json({ msg: "You cannot delete your own account." });
+    }
+    await User.findByIdAndDelete(req.params.id);
+    res.json({ message: 'User deleted' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- SUBSCRIBER ROUTES ---
 app.delete('/subscribers', auth, async (req, res) => {
     try {
         const { email } = req.body;
