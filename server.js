@@ -1,4 +1,4 @@
-// server.js (FINAL: Edge + Auth + Resend + SUPER ADMIN LOCK)
+// server.js (FINAL: Edge + Auth + Admin Key + MULTI-USER EMAILS)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -10,109 +10,82 @@ const { Resend } = require('resend');
 const bcrypt = require('bcryptjs'); 
 const jwt = require('jsonwebtoken'); 
 
-// 1. Force IPv4 (Critical for stability)
+// 1. Force IPv4
 dns.setDefaultResultOrder('ipv4first');
 
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: SUPER ADMIN MODE (LOCKED TO NUWAN)");
+console.log("🚀 VERSION: FINAL (MULTI-RESEND ACCOUNT SUPPORT)");
 console.log("------------------------------------------------");
 
 // 🔥 CONFIG
 const EDGE_MONITORS = ["slpost", "Finger print", "MORS", "mms"]; 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-to-something-secret";
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || "nuwan-secure-2026"; 
-const SUPER_ADMIN_EMAIL = "m.nuwan245@gmail.com"; // 🔒 LOCK: Only this email can delete users
+const SUPER_ADMIN_EMAIL = "m.nuwan245@gmail.com"; 
+
+// 📧 EMAIL MAPPING CONFIGURATION
+// ⚠️ YOU MUST UPDATE THIS LIST EVERY TIME YOU ADD A NEW FREE SUBSCRIBER
+const EMAIL_KEYS = {
+    // "Subscriber Email" : process.env.THEIR_KEY
+    "m.nuwan245@gmail.com": process.env.RESEND_API_KEY_MAIN, 
+    "ssanetwork@slpost.lk": process.env.RESEND_API_KEY_FRIEND // <--- CHANGE THIS TO REAL EMAIL
+};
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(express.json());
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "*", 
-  credentials: true
-}));
+app.use(cors({ origin: process.env.FRONTEND_URL || "*", credentials: true }));
 
-// Database
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
 // --- SCHEMAS ---
-const UserSchema = new mongoose.Schema({
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true }
-});
-
+const UserSchema = new mongoose.Schema({ email: { type: String, unique: true }, password: String });
 const MonitorSchema = new mongoose.Schema({
-  name: String,
-  url: String,
-  status: { type: String, default: 'unknown' },
-  lastChecked: Date,
-  downSince: Date, 
-  alertSent: { type: Boolean, default: false },
+  name: String, url: String, status: { type: String, default: 'unknown' },
+  lastChecked: Date, downSince: Date, alertSent: { type: Boolean, default: false },
   history: [{ status: String, timestamp: { type: Date, default: Date.now } }]
 });
-
-const SubscriberSchema = new mongoose.Schema({
-  email: { type: String, unique: true, required: true }
-});
+const SubscriberSchema = new mongoose.Schema({ email: { type: String, unique: true } });
 
 const User = mongoose.model('User', UserSchema);
 const Monitor = mongoose.model('Monitor', MonitorSchema);
 const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
-const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- 🔒 MIDDLEWARE: PROTECT ROUTES ---
+// --- 🔒 MIDDLEWARE ---
 const auth = (req, res, next) => {
   const token = req.header('x-auth-token');
   if (req.path === '/api/edge-update') return next();
-  if (!token) return res.status(401).json({ msg: 'No token, authorization denied' });
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // Contains { id: ... }
-    next();
-  } catch (e) {
-    res.status(400).json({ msg: 'Token is not valid' });
-  }
+  if (!token) return res.status(401).json({ msg: 'No token' });
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); } 
+  catch (e) { res.status(400).json({ msg: 'Invalid Token' }); }
 };
 
 // --- AUTH ROUTES ---
-
-// 1. Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, adminKey } = req.body; 
-    if (adminKey !== ADMIN_SECRET) return res.status(403).json({ msg: "Invalid Admin Secret Key." });
+    if (adminKey !== ADMIN_SECRET) return res.status(403).json({ msg: "Invalid Admin Key." });
+    if (await User.findOne({ email })) return res.status(400).json({ msg: 'User exists' });
 
-    let user = await User.findOne({ email });
-    if (user) return res.status(400).json({ msg: 'User already exists' });
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    user = new User({ email, password: hashedPassword });
+    const hashedPassword = await bcrypt.hash(password, await bcrypt.genSalt(10));
+    const user = new User({ email, password: hashedPassword });
     await user.save();
 
-    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ token, user: { id: user._id, email: user.email } });
+    res.json({ token: jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '1h' }), user: { id: user._id, email } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ msg: 'User does not exist' });
-
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
-
-    const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ token, user: { id: user._id, email: user.email } });
+    if (!user || !(await bcrypt.compare(password, user.password))) return res.status(400).json({ msg: 'Invalid credentials' });
+    res.json({ token: jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '24h' }), user: { id: user._id, email } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -131,17 +104,45 @@ function checkTcp(targetUrl) {
     });
 }
 
+// 📧 INSTANT LOOP ALERT SYSTEM
 async function sendAlert(monitor, status) {
-  const subscribers = await Subscriber.find();
+  const subscribers = await Subscriber.find(); // Get everyone from DB
   if (subscribers.length === 0) return;
+
   const isUp = status === 'up';
   const subject = isUp ? `✅ RECOVERY: ${monitor.name}` : `🚨 ALERT: ${monitor.name} is DOWN`;
   const text = isUp ? `Service "${monitor.name}" is back online.` : `Service "${monitor.name}" is DOWN.`;
-  try {
-    await resend.emails.send({
-      from: 'onboarding@resend.dev', to: subscribers.map(s => s.email), subject, text
-    });
-  } catch (err) { console.error("Email Error:", err.message); }
+
+  console.log(`📧 Blasting alerts to ${subscribers.length} subscribers...`);
+
+  // This loop runs instantly for each person
+  for (const sub of subscribers) {
+      const recipientEmail = sub.email;
+      
+      // 1. Find the specific key for this person
+      const apiKey = EMAIL_KEYS[recipientEmail];
+      
+      // 2. If no key is mapped in code, we can't send (Free Tier Limitation)
+      if (!apiKey) {
+          console.log(`⚠️ Skipping ${recipientEmail} (No API Key found in server.js)`);
+          continue;
+      }
+
+      try {
+          // 3. Switch Identity to the correct Resend Account
+          const currentResend = new Resend(apiKey);
+          
+          await currentResend.emails.send({
+              from: 'onboarding@resend.dev',
+              to: recipientEmail,
+              subject: subject,
+              text: text
+          });
+          console.log(`   ✅ Sent to: ${recipientEmail}`);
+      } catch (err) {
+          console.error(`   ❌ Failed to send to ${recipientEmail}:`, err.message);
+      }
+  }
 }
 
 async function updateMonitorStatus(monitor, currentStatus) {
@@ -193,9 +194,10 @@ async function checkMonitors() {
 setInterval(checkMonitors, 60000);
 
 // --- ROUTES ---
-app.get('/', (req, res) => res.send('Uptime Monitor is Running 🟢'));
+app.get('/', (req, res) => res.send('Uptime Monitor Active 🟢'));
 app.get('/monitors', async (req, res) => res.json(await Monitor.find()));
 app.get('/subscribers', async (req, res) => res.json(await Subscriber.find()));
+
 app.post('/api/edge-update', async (req, res) => {
     try {
         const { name, status } = req.body; 
@@ -206,7 +208,6 @@ app.post('/api/edge-update', async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// 🔒 PROTECTED MONITOR ROUTES (Any Admin)
 app.post('/monitors', auth, async (req, res) => { 
   try {
     const { name, url } = req.body;
@@ -221,47 +222,28 @@ app.delete('/monitors/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- 🔒 SUPER ADMIN ONLY ROUTES (Restricted to Nuwan) ---
+// --- SUPER ADMIN ROUTES ---
 app.get('/api/users', auth, async (req, res) => {
   try {
-    // 1. Fetch the actual user from DB to check email
     const currentUser = await User.findById(req.user.id);
-    
-    // 2. Strict Email Check
-    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) {
-        return res.status(403).json({ msg: "Access Denied. Only the Super Admin can view users." });
-    }
-
-    const users = await User.find().select('-password'); 
-    res.json(users);
+    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) return res.status(403).json({ msg: "Access Denied." });
+    res.json(await User.find().select('-password'));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/users/:id', auth, async (req, res) => {
   try {
-    // 1. Fetch the actual user from DB
     const currentUser = await User.findById(req.user.id);
-
-    // 2. Strict Email Check
-    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) {
-        return res.status(403).json({ msg: "Access Denied. Only the Super Admin can delete users." });
-    }
-
-    if (req.user.id === req.params.id) {
-        return res.status(400).json({ msg: "You cannot delete your own account." });
-    }
+    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) return res.status(403).json({ msg: "Access Denied." });
+    if (req.user.id === req.params.id) return res.status(400).json({ msg: "Cannot delete self." });
     await User.findByIdAndDelete(req.params.id);
     res.json({ message: 'User deleted' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- SUBSCRIBER ROUTES ---
 app.delete('/subscribers', auth, async (req, res) => {
-    try {
-        const { email } = req.body;
-        await Subscriber.deleteOne({ email });
-        res.json({ message: 'Deleted subscriber' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    try { await Subscriber.deleteOne({ email: req.body.email }); res.json({ message: 'Deleted subscriber' }); } 
+    catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/subscribers', async (req, res) => {
@@ -273,10 +255,12 @@ app.post('/subscribers', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Test Email Route (For Main account only)
 app.get('/api/test-email', async (req, res) => {
     try {
+        const resend = new Resend(process.env.RESEND_API_KEY_MAIN);
         const { data, error } = await resend.emails.send({
-            from: 'onboarding@resend.dev', to: 'your-email@gmail.com', subject: 'Test', text: 'It works!'
+            from: 'onboarding@resend.dev', to: 'm.nuwan245@gmail.com', subject: 'Test', text: 'It works!'
         });
         if (error) return res.status(500).json({ error });
         res.json({ success: true, data });
