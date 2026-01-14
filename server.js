@@ -1,4 +1,4 @@
-// server.js (FINAL: Edge + Auth + Admin Key + MULTI-USER EMAILS)
+// server.js (FINAL: Cloud Only + Multi-Email Support + Admin Fixes)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -16,22 +16,22 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: FINAL (MULTI-RESEND ACCOUNT SUPPORT)");
+console.log("🚀 VERSION: FINAL CLOUD (MULTI-EMAIL + NO EDGE)");
 console.log("------------------------------------------------");
 
 // 🔥 CONFIG
-const EDGE_MONITORS = ["slpost", "Finger print", "MORS", "mms"]; 
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-to-something-secret";
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || "nuwan-secure-2026"; 
 const SUPER_ADMIN_EMAIL = "m.nuwan245@gmail.com"; 
 
-// 📧 EMAIL MAPPING CONFIGURATION
-// ⚠️ YOU MUST UPDATE THIS LIST EVERY TIME YOU ADD A NEW FREE SUBSCRIBER
+// 📧 EMAIL MAPPING
+// This loops through everyone. "At once" means it fires them all in a split second.
 const EMAIL_KEYS = {
-    // "Subscriber Email" : process.env.THEIR_KEY
     "m.nuwan245@gmail.com": process.env.RESEND_API_KEY_MAIN, 
-    "ssanetwork@slpost.lk": process.env.RESEND_API_KEY_FRIEND // <--- CHANGE THIS TO REAL EMAIL
+    "ssanetwork@slpost.lk": process.env.RESEND_API_KEY_FRIEND // ✅ Your 2nd Subscriber
 };
+// Fallback (Optional)
+const DEFAULT_KEY = process.env.RESEND_API_KEY_MAIN;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -59,7 +59,6 @@ const Subscriber = mongoose.model('Subscriber', SubscriberSchema);
 // --- 🔒 MIDDLEWARE ---
 const auth = (req, res, next) => {
   const token = req.header('x-auth-token');
-  if (req.path === '/api/edge-update') return next();
   if (!token) return res.status(401).json({ msg: 'No token' });
   try { req.user = jwt.verify(token, JWT_SECRET); next(); } 
   catch (e) { res.status(400).json({ msg: 'Invalid Token' }); }
@@ -104,44 +103,34 @@ function checkTcp(targetUrl) {
     });
 }
 
-// 📧 INSTANT LOOP ALERT SYSTEM
+// 📧 SEND ALERT (MULTI-KEY LOOP)
 async function sendAlert(monitor, status) {
-  const subscribers = await Subscriber.find(); // Get everyone from DB
+  const subscribers = await Subscriber.find(); 
   if (subscribers.length === 0) return;
 
   const isUp = status === 'up';
   const subject = isUp ? `✅ RECOVERY: ${monitor.name}` : `🚨 ALERT: ${monitor.name} is DOWN`;
   const text = isUp ? `Service "${monitor.name}" is back online.` : `Service "${monitor.name}" is DOWN.`;
 
-  console.log(`📧 Blasting alerts to ${subscribers.length} subscribers...`);
+  console.log(`📧 Preparing alerts for ${subscribers.length} subscribers...`);
 
-  // This loop runs instantly for each person
+  // Loop through everyone and send instantly
   for (const sub of subscribers) {
       const recipientEmail = sub.email;
+      const apiKey = EMAIL_KEYS[recipientEmail] || DEFAULT_KEY;
       
-      // 1. Find the specific key for this person
-      const apiKey = EMAIL_KEYS[recipientEmail];
-      
-      // 2. If no key is mapped in code, we can't send (Free Tier Limitation)
       if (!apiKey) {
-          console.log(`⚠️ Skipping ${recipientEmail} (No API Key found in server.js)`);
+          console.log(`⚠️ Skipping ${recipientEmail} (No API Key mapped)`);
           continue;
       }
-
       try {
-          // 3. Switch Identity to the correct Resend Account
           const currentResend = new Resend(apiKey);
-          
+          // Async send - we await it to ensure it goes through before the loop continues
           await currentResend.emails.send({
-              from: 'onboarding@resend.dev',
-              to: recipientEmail,
-              subject: subject,
-              text: text
+              from: 'onboarding@resend.dev', to: recipientEmail, subject, text
           });
           console.log(`   ✅ Sent to: ${recipientEmail}`);
-      } catch (err) {
-          console.error(`   ❌ Failed to send to ${recipientEmail}:`, err.message);
-      }
+      } catch (err) { console.error(`   ❌ Failed to send to ${recipientEmail}:`, err.message); }
   }
 }
 
@@ -172,14 +161,13 @@ async function updateMonitorStatus(monitor, currentStatus) {
     await monitor.save();
 }
 
-// --- CLOUD MONITOR LOOP ---
+// --- MONITORING LOOP (Standard - No Edge) ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   for (const monitor of monitors) {
     try {
-      if (EDGE_MONITORS.includes(monitor.name)) continue; 
       let currentStatus = 'down';
       try {
         await axios.get(monitor.url, { timeout: 5000, httpsAgent, headers: { 'User-Agent': 'UptimeBot/1.0' } });
@@ -198,16 +186,6 @@ app.get('/', (req, res) => res.send('Uptime Monitor Active 🟢'));
 app.get('/monitors', async (req, res) => res.json(await Monitor.find()));
 app.get('/subscribers', async (req, res) => res.json(await Subscriber.find()));
 
-app.post('/api/edge-update', async (req, res) => {
-    try {
-        const { name, status } = req.body; 
-        const monitor = await Monitor.findOne({ name });
-        if (!monitor) return res.status(404).json({ error: "Monitor not found" });
-        await updateMonitorStatus(monitor, status);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 app.post('/monitors', auth, async (req, res) => { 
   try {
     const { name, url } = req.body;
@@ -222,11 +200,14 @@ app.delete('/monitors/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- SUPER ADMIN ROUTES ---
+// --- SUPER ADMIN ROUTES (With Case-Insensitive Fix) ---
 app.get('/api/users', auth, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.id);
-    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) return res.status(403).json({ msg: "Access Denied." });
+    // 🔒 FIX: Convert to lowercase to catch "M.Nuwan..." vs "m.nuwan..."
+    if (!currentUser || currentUser.email.toLowerCase() !== SUPER_ADMIN_EMAIL.toLowerCase()) {
+        return res.status(403).json({ msg: "Access Denied." });
+    }
     res.json(await User.find().select('-password'));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -234,7 +215,9 @@ app.get('/api/users', auth, async (req, res) => {
 app.delete('/api/users/:id', auth, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.id);
-    if (!currentUser || currentUser.email !== SUPER_ADMIN_EMAIL) return res.status(403).json({ msg: "Access Denied." });
+    if (!currentUser || currentUser.email.toLowerCase() !== SUPER_ADMIN_EMAIL.toLowerCase()) {
+        return res.status(403).json({ msg: "Access Denied." });
+    }
     if (req.user.id === req.params.id) return res.status(400).json({ msg: "Cannot delete self." });
     await User.findByIdAndDelete(req.params.id);
     res.json({ message: 'User deleted' });
@@ -253,18 +236,6 @@ app.post('/subscribers', async (req, res) => {
     await Subscriber.updateOne({ email }, { email }, { upsert: true });
     res.json({ message: 'Subscribed' });
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Test Email Route (For Main account only)
-app.get('/api/test-email', async (req, res) => {
-    try {
-        const resend = new Resend(process.env.RESEND_API_KEY_MAIN);
-        const { data, error } = await resend.emails.send({
-            from: 'onboarding@resend.dev', to: 'm.nuwan245@gmail.com', subject: 'Test', text: 'It works!'
-        });
-        if (error) return res.status(500).json({ error });
-        res.json({ success: true, data });
-    } catch (e) { res.status(500).json({ error: e.message }); } 
 });
 
 app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
