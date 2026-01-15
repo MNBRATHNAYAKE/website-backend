@@ -1,4 +1,4 @@
-// server.js (FINAL: Cloud Only + Multi-Email Support + Admin Fixes)
+// server.js (FINAL: Cloud Only + Multi-Email + Multi-Admin)
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -16,21 +16,25 @@ dns.setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 
 console.log("------------------------------------------------");
-console.log("🚀 VERSION: FINAL CLOUD (MULTI-EMAIL + NO EDGE)");
+console.log("🚀 VERSION: FINAL (MULTI-ADMIN ACCESS)");
 console.log("------------------------------------------------");
 
 // 🔥 CONFIG
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-to-something-secret";
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY || "nuwan-secure-2026"; 
-const SUPER_ADMIN_EMAIL = "m.nuwan245@gmail.com"; 
 
-// 📧 EMAIL MAPPING
-// This loops through everyone. "At once" means it fires them all in a split second.
+// 👑 SUPER ADMINS (Who can view/delete users)
+// ✅ Both emails in this list have full "Users" button access
+const SUPER_ADMINS = [
+  "m.nuwan245@gmail.com", 
+  "ssanetwork@slpost.lk"
+];
+
+// 📧 EMAIL MAPPING (For Alerts)
 const EMAIL_KEYS = {
     "m.nuwan245@gmail.com": process.env.RESEND_API_KEY_MAIN, 
-    "ssanetwork@slpost.lk": process.env.RESEND_API_KEY_FRIEND // ✅ Your 2nd Subscriber
+    "ssanetwork@slpost.lk": process.env.RESEND_API_KEY_FRIEND 
 };
-// Fallback (Optional)
 const DEFAULT_KEY = process.env.RESEND_API_KEY_MAIN;
 
 const app = express();
@@ -114,7 +118,6 @@ async function sendAlert(monitor, status) {
 
   console.log(`📧 Preparing alerts for ${subscribers.length} subscribers...`);
 
-  // Loop through everyone and send instantly
   for (const sub of subscribers) {
       const recipientEmail = sub.email;
       const apiKey = EMAIL_KEYS[recipientEmail] || DEFAULT_KEY;
@@ -125,7 +128,6 @@ async function sendAlert(monitor, status) {
       }
       try {
           const currentResend = new Resend(apiKey);
-          // Async send - we await it to ensure it goes through before the loop continues
           await currentResend.emails.send({
               from: 'onboarding@resend.dev', to: recipientEmail, subject, text
           });
@@ -161,7 +163,7 @@ async function updateMonitorStatus(monitor, currentStatus) {
     await monitor.save();
 }
 
-// --- MONITORING LOOP (Standard - No Edge) ---
+// --- MONITORING LOOP ---
 async function checkMonitors() {
   const monitors = await Monitor.find();
   const httpsAgent = new https.Agent({ rejectUnauthorized: false });
@@ -200,12 +202,13 @@ app.delete('/monitors/:id', auth, async (req, res) => {
   res.json({ message: 'Deleted' });
 });
 
-// --- SUPER ADMIN ROUTES (With Case-Insensitive Fix) ---
+// --- SUPER ADMIN ROUTES (CHECK LIST) ---
 app.get('/api/users', auth, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.id);
-    // 🔒 FIX: Convert to lowercase to catch "M.Nuwan..." vs "m.nuwan..."
-    if (!currentUser || currentUser.email.toLowerCase() !== SUPER_ADMIN_EMAIL.toLowerCase()) {
+    
+    // 🔒 CHECK: Is current email in the allowed list?
+    if (!currentUser || !SUPER_ADMINS.includes(currentUser.email.toLowerCase())) {
         return res.status(403).json({ msg: "Access Denied." });
     }
     res.json(await User.find().select('-password'));
@@ -215,9 +218,12 @@ app.get('/api/users', auth, async (req, res) => {
 app.delete('/api/users/:id', auth, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.id);
-    if (!currentUser || currentUser.email.toLowerCase() !== SUPER_ADMIN_EMAIL.toLowerCase()) {
+    
+    // 🔒 CHECK: Is current email in the allowed list?
+    if (!currentUser || !SUPER_ADMINS.includes(currentUser.email.toLowerCase())) {
         return res.status(403).json({ msg: "Access Denied." });
     }
+    
     if (req.user.id === req.params.id) return res.status(400).json({ msg: "Cannot delete self." });
     await User.findByIdAndDelete(req.params.id);
     res.json({ message: 'User deleted' });
